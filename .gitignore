@@ -1,0 +1,6 @@
+node_modules/
+npm-debug.log*
+.DS_Store
+
+# dist/app.js is deliberately NOT ignored — GitHub Pages serves it with no build step.
+# See workout_tracker.md §3.

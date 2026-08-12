@@ -6,7 +6,7 @@ Handover doc for **Gains** — a workout tracker running as a Telegram Mini App.
 > changing anything. **Update it in the same commit as any change** — see
 > [Maintaining this doc](#maintaining-this-doc) at the bottom.
 
-Last updated: 2026-08-12 · Status: built and tested, not yet deployed
+Last updated: 2026-08-12 · Status: builds clean, all three suites green, **not yet deployed**
 
 ---
 
@@ -57,20 +57,29 @@ rejected as unnecessary once Telegram CloudStorage covered the storage need.
 .
 ├── workout_tracker.md   ← this file
 ├── package.json
+├── .gitignore           ← ignores node_modules; deliberately does NOT ignore dist/
 ├── src/
-│   ├── app.jsx          ← the entire app (~1600 lines, single file by design)
-│   └── main.jsx         ← mounts <App/> into #root
+│   ├── app.jsx          ← the entire app (~1700 lines, single file by design)
+│   └── main.jsx         ← mounts <App/> into #root; also calls tg.ready()/expand()
 ├── dist/
 │   ├── index.html       ← page shell; loads Telegram SDK + Tailwind CDN + app.js
 │   └── app.js           ← build output, COMMITTED (GitHub Pages serves it directly)
 └── tests/
-    ├── smoke.mjs        ← renders the bundle in jsdom, asserts no errors
+    ├── dom.mjs          ← shared jsdom harness + assertion helpers (no test cases)
+    ├── smoke.mjs        ← renders the bundle in jsdom, visits every tab, asserts no errors
     ├── test-autosave.mjs← logs a set, kills app, reopens, asserts restore
     └── test-flow.mjs    ← coach + rating + leaderboard end-to-end
 ```
 
 `dist/app.js` **is committed on purpose** — GitHub Pages serves static files with no
-build step, so the built bundle must be in the repo.
+build step, so the built bundle must be in the repo. **Rebuild before every push**, or the
+deployed app silently stays on the old code.
+
+The bundle is an IIFE and exports nothing, so all three suites drive the real UI through
+jsdom rather than importing functions. `tests/dom.mjs` holds the shared setup: it stubs
+`AudioContext`, `requestAnimationFrame`, `getBoundingClientRect` and **`ResizeObserver`**
+(recharts' `ResponsiveContainer` throws without it in jsdom; real browsers have it). Any
+new test should import from there rather than rebuilding its own DOM.
 
 ### Commands
 
@@ -200,7 +209,9 @@ recalculation**, so cutting or bulking re-contextualises past sessions too.
 
 There is **no published strength-standard database for dumbbell lifts**. The `avg`
 benchmarks in `EXERCISE_META` are estimates derived from barbell standards. This is
-stated to the user in the UI and should stay stated. Do not present these as clinical.
+stated to the user in the UI — a footer line at the bottom of `RatingCard` — and should
+stay stated. Do not present these as clinical. `tests/test-flow.mjs` asserts the caveat is
+still rendered.
 
 ---
 
@@ -218,7 +229,9 @@ today's planned exercises against the most recent session of the same day.
 | No history | Neutral encouragement, no invented numbers |
 
 Pain words live in `PAIN_WORDS`. The pain branch is checked **before** any progression
-branch and must stay that way.
+branch and must stay that way. `tests/test-flow.mjs` seeds a lateral raise that *both*
+flagged pain *and* hit the top of its rep range, then asserts the coach backs off instead
+of adding weight — that test fails the moment the ordering is reversed.
 
 An earlier version called the Anthropic API from the client. That was removed — it
 needed a key shipped in client-side code, which is not safe. Don't reintroduce it
@@ -265,20 +278,45 @@ Layout notes:
 
 ## 10. Deploying
 
-**GitHub Pages:** push the repo, Settings → Pages → deploy from `main`, root folder.
-Live at `https://<user>.github.io/<repo>/dist/` (or move `dist/` contents to root and
-serve from there — simpler).
+Remote is already set: `https://github.com/ramzeus3010/WorkoutELO.git`.
 
-**BotFather:** `/newbot` → `/newapp` (paste the HTTPS URL) → `/setmenubutton`.
+**1. GitHub Pages** — push `main`, then on github.com: **Settings → Pages → Source:
+"Deploy from a branch" → Branch `main`, folder `/ (root)` → Save.** First build takes
+1–2 minutes. The app then lives at:
 
-Updates are just a rebuild + push; users get them on next open, no reinstall.
+```
+https://ramzeus3010.github.io/WorkoutELO/dist/
+```
+
+Open that in a normal browser first and confirm it renders — outside Telegram it falls
+back to `localStorage`, so it's fully usable as a sanity check. If the page is blank,
+check the browser console: a 404 on `app.js` means Pages hasn't finished building, or the
+folder setting is wrong.
+
+**2. BotFather** (in Telegram, talk to [@BotFather](https://t.me/BotFather)):
+
+| Command | What to answer |
+|---|---|
+| `/newbot` | display name, then a username ending in `bot` — save the token it gives you, even though this app doesn't use one |
+| `/newapp` | pick the bot → title, short description, a 640×360 icon, then paste the Pages URL above |
+| `/setmenubutton` | pick the bot → paste the same URL → set the button label (e.g. "Open Gains") |
+
+`/newapp` requires an image; anything 640×360 works, it can be replaced later.
+
+**3. Updating.** `npm run build`, commit `dist/app.js`, push. Users get the new version on
+next open — no reinstall, no store review. Telegram caches the webview aggressively; if a
+change doesn't appear, fully close the mini app (swipe it away, don't just background it)
+and reopen.
 
 ---
 
 ## 11. Open items
 
 - [ ] **Never deployed or opened in a real Telegram client.** All testing is jsdom.
-      Real-device layout/sizing is unverified.
+      Real-device layout/sizing is unverified, and CloudStorage has never actually run —
+      every test so far has exercised the `localStorage` fallback path only.
+- [ ] **The app has two names.** `dist/index.html` sets the title to "Gains"; the in-app
+      `Header` renders "Iron & Ledger". Pick one before telling anyone else about it.
 - [ ] **Lower B still has hip thrusts**, which he said he doesn't want. Needs a
       replacement (back extension or a hamstring curl machine) — ask before swapping.
 - [ ] Duration exercises (planks, rowing erg) are logged as seconds in the reps field.
@@ -309,3 +347,6 @@ Updates are just a rebuild + push; users get them on next open, no reinstall.
 | 2026-08-12 | Lower A reworked: leg press replaces goblet squat, leg extension replaces hip thrust, rowing erg added. |
 | 2026-08-12 | Added layoff decay so long breaks drop the rating meaningfully. |
 | 2026-08-12 | Added drop sets, per-exercise notes, form links, Profile tab, rating/tier system. |
+| 2026-08-12 | Repo was flat and unbuildable — no `src/main.jsx`, no `tests/`, and a stale `app.js` predating the Lower A rework. Restored the documented layout, wrote the missing entry point, and rebuilt. |
+| 2026-08-12 | Wrote the two missing suites (`smoke.mjs`, `test-flow.mjs`) that `npm test` already referenced, and extracted the jsdom setup into `tests/dom.mjs` so all three share one harness. Added a `ResizeObserver` stub — without it recharts throws in jsdom and the Progress tab can't be tested at all. |
+| 2026-08-12 | Surfaced the §6 dumbbell-benchmark caveat in `RatingCard`. The doc claimed it was shown to the user; it only existed as a source comment. Now rendered, and asserted by `test-flow.mjs`. |

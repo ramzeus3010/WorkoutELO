@@ -1440,6 +1440,13 @@ function RatingCard({ eloResult, profile }) {
           {staleCount} exercise{staleCount > 1 ? "s" : ""} untouched or fading — training them keeps your climb faster.
         </p>
       )}
+
+      {/* Honesty note — see workout_tracker.md §6. There is no published strength-standard
+          database for dumbbell lifts, so the benchmarks are derived estimates. Keep this visible. */}
+      <p className="text-xs text-gray-500 mt-3 leading-snug">
+        Benchmarks are directional estimates derived from barbell standards — no published dumbbell
+        strength database exists. Treat this as a game score, not a clinical measure.
+      </p>
     </div>
   );
 }
