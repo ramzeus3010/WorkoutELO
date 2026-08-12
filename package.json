@@ -1,0 +1,24 @@
+{
+  "name": "gains-telegram",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Workout tracker as a Telegram Mini App",
+  "scripts": {
+    "build": "esbuild src/main.jsx --bundle --format=iife --outfile=dist/app.js --loader:.jsx=jsx --define:process.env.NODE_ENV='\"production\"' --minify",
+    "test": "npm run build && node tests/smoke.mjs && node tests/test-autosave.mjs && node tests/test-flow.mjs",
+    "test:smoke": "node tests/smoke.mjs",
+    "test:autosave": "node tests/test-autosave.mjs",
+    "test:flow": "node tests/test-flow.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.383.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5",
+    "jsdom": "^24.1.0"
+  }
+}
