@@ -13,12 +13,15 @@ w1.eval(BUNDLE);
 await sleep(500);
 
 const doc1 = w1.document;
-const numberInputs = [...doc1.querySelectorAll('input[type="number"]')];
-const kg = numberInputs.find((i) => i.placeholder === "kg");
-const reps = numberInputs.find((i) => i.placeholder === "reps");
+// Matched by placeholder, not type: the weight field is type="text" + inputMode="decimal"
+// so iOS gives it a working decimal point (see the comment on the input in app.jsx).
+const kg = doc1.querySelector('input[placeholder="kg"]');
+const reps = doc1.querySelector('input[placeholder="reps"]');
 check("first exercise card exposes weight and reps inputs", !!kg && !!reps);
+check("weight field asks for a decimal keypad", kg && kg.getAttribute("inputmode") === "decimal");
 
-setNativeValue(w1, kg, "12");
+// A decimal weight must survive — entering 7.5 kg was impossible before this.
+setNativeValue(w1, kg, "12.5");
 setNativeValue(w1, reps, "10");
 await sleep(100);
 
@@ -38,8 +41,8 @@ if (draft) {
   check("draft records the current day", parsed.day === "Upper A", `got ${parsed.day}`);
   check("exactly the logged exercise carries sets", withSets.length === 1, `got ${withSets.length}`);
   check(
-    "the set is stored with the values entered",
-    withSets[0] && withSets[0].sets[0] && withSets[0].sets[0].weight === 12 && withSets[0].sets[0].reps === 10,
+    "the decimal weight is stored as entered, not truncated",
+    withSets[0] && withSets[0].sets[0] && withSets[0].sets[0].weight === 12.5 && withSets[0].sets[0].reps === 10,
     JSON.stringify(withSets[0] && withSets[0].sets)
   );
 }
@@ -55,7 +58,7 @@ w2.eval(BUNDLE);
 await sleep(900);
 
 const text2 = rootText(w2);
-check("in-progress set is restored on reopen", text2.includes("12") && text2.includes("Set 1"));
+check("in-progress set is restored on reopen", text2.includes("12.5") && text2.includes("Set 1"));
 check("no console errors on restore", errs2.length === 0, errs2.slice(0, 3).join(" | "));
 
 finish("autosave");

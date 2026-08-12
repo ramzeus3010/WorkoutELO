@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { Plus, X, Save, ChevronDown, ChevronUp, Trash2, TrendingUp, Dumbbell, History, LineChart as LineChartIcon, Loader2, Play, Pause, RotateCcw, SkipForward, ExternalLink, NotebookPen, Sparkles, ArrowDown, User, Award, Users, Share2, Check } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
@@ -92,6 +93,7 @@ const LAYOFF_GRACE_DAYS = 7; // gaps up to a week between ANY two sessions cause
 const LAYOFF_HALF_LIFE_DAYS = 21; // beyond the grace window, every 21 "excess" days pulls the rating halfway back toward baseline
 
 const TIERS = [
+  // Bronze deliberately stays orange — it's a metal, not the brand accent.
   { name: "Bronze", min: 0, color: "text-orange-700", bg: "bg-orange-100" },
   { name: "Silver", min: 1000, color: "text-gray-500", bg: "bg-gray-200" },
   { name: "Gold", min: 1200, color: "text-yellow-600", bg: "bg-yellow-100" },
@@ -313,14 +315,17 @@ export default function App() {
   }
 
   const loading = sessions === null || profile === null;
-  const timerActive = !!timer.state;
 
   return (
     <div
       className="min-h-screen bg-white text-gray-900 font-sans"
       style={{ colorScheme: "light" }}
     >
-      <div className={`max-w-md mx-auto ${timerActive ? "pb-44" : "pb-24"}`}>
+      {/* pb-24 clears the bottom nav. It used to switch to pb-44 when the rest timer was
+          showing, because the old timer bar floated above the nav and covered the Save
+          button. The ring doesn't overlap anything, so one constant is enough now. */}
+      <div className="max-w-md mx-auto pb-24">
+        <RestReadout timer={timer} />
         <Header saving={saving} />
         {loading ? (
           <div className="flex items-center justify-center gap-2 text-gray-500 py-24">
@@ -330,7 +335,7 @@ export default function App() {
         ) : (
           <>
             {error && (
-              <div className="mx-4 mt-3 rounded-md border border-orange-300 bg-orange-50 px-3 py-2 text-xs text-orange-700">
+              <div className="mx-4 mt-3 rounded-md border border-maroon-300 bg-maroon-50 px-3 py-2 text-xs text-maroon-700">
                 {error}
               </div>
             )}
@@ -341,7 +346,7 @@ export default function App() {
           </>
         )}
       </div>
-      {timerActive && <RestTimerBar timer={timer} liftAbove={true} />}
+      <RestRing timer={timer} />
       <BottomNav tab={tab} setTab={setTab} />
     </div>
   );
@@ -353,8 +358,8 @@ function Header({ saving }) {
     <div className="px-5 pt-6 pb-4 border-b border-gray-200">
       <div className="flex items-baseline justify-between">
         <div>
-          <p className="text-xs tracking-widest uppercase text-orange-600 font-semibold mb-1">Training Log</p>
-          <h1 className="text-2xl font-bold tracking-tight">Iron &amp; Ledger</h1>
+          <p className="text-xs tracking-widest uppercase text-maroon-600 font-semibold mb-1">Training Log</p>
+          <h1 className="text-3xl font-bold tracking-tight">Chetamba</h1>
         </div>
         {saving && <Loader2 className="animate-spin text-gray-500" size={16} />}
       </div>
@@ -378,7 +383,7 @@ function BottomNav({ tab, setTab }) {
             key={id}
             onClick={() => setTab(id)}
             className={`flex flex-col items-center gap-1 py-3 text-xs transition-colors ${
-              tab === id ? "text-orange-600" : "text-gray-500"
+              tab === id ? "text-maroon-600" : "text-gray-500"
             }`}
           >
             <Icon size={18} />
@@ -390,44 +395,114 @@ function BottomNav({ tab, setTab }) {
   );
 }
 
-// ---------- Rest Timer Bar (floating, above bottom nav) ----------
-function RestTimerBar({ timer }) {
-  const { state, remaining, pause, resume, addTime, dismiss } = timer;
-  const pct = state ? Math.min(1, Math.max(0, 1 - remaining / state.total)) : 0;
-  const done = state && remaining <= 0;
+// ---------- Rest timer: edge ring + top readout ----------
+// This used to be a bar floating above the bottom nav. On a phone the keyboard pushes that
+// bar upward and it lands exactly on top of the weight/reps inputs, so you can't see the
+// number you're typing. The timer is now a loop drawn around the screen edge instead:
+// always visible, never on top of a control, and it shrinks as the rest runs down.
+// The exact seconds live in RestReadout at the very top of the page — scroll up for them.
+
+// Measured from the layout viewport, not visualViewport: when the keyboard opens we want
+// the ring to stay pinned to the physical screen edge rather than reflowing around the
+// keyboard, which would put its bottom edge right back over the inputs.
+function useViewportBox() {
+  const [box, setBox] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const measure = () => setBox({ w: window.innerWidth, h: window.innerHeight });
+    measure();
+    window.addEventListener("resize", measure);
+    window.addEventListener("orientationchange", measure);
+    return () => {
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("orientationchange", measure);
+    };
+  }, []);
+  return box;
+}
+
+const RING_INSET = 3;    // px between the screen edge and the outside of the stroke
+const RING_WIDTH = 7;    // px stroke — thick enough to read peripherally while lifting
+const RING_RADIUS = 20;  // px corner rounding
+
+function RestRing({ timer }) {
+  const { state, remaining } = timer;
+  const { w, h } = useViewportBox();
+  if (!state || w === 0 || h === 0) return null;
+
+  const done = remaining <= 0;
+  const edge = RING_INSET + RING_WIDTH / 2;
+  const boxW = w - 2 * edge;
+  const boxH = h - 2 * edge;
+  if (boxW <= 0 || boxH <= 0) return null;
+
+  const r = Math.min(RING_RADIUS, boxW / 2, boxH / 2);
+  // Rounded-rect perimeter: the four straight runs plus one full circle's worth of corners.
+  const perim = 2 * (boxW - 2 * r) + 2 * (boxH - 2 * r) + 2 * Math.PI * r;
+  const fractionLeft = done ? 0 : Math.min(1, Math.max(0, remaining / state.total));
 
   return (
-    <div className="fixed bottom-16 inset-x-0 z-20">
-      <div className="max-w-md mx-auto px-3 pb-2">
-        <div className={`rounded-xl border overflow-hidden shadow-lg ${done ? "bg-emerald-50 border-emerald-300" : "bg-gray-50 border-gray-200"}`}>
-          <div className="h-1 bg-gray-200">
-            <div
-              className={`h-full transition-all ${done ? "bg-emerald-600" : "bg-orange-600"}`}
-              style={{ width: `${pct * 100}%` }}
-            />
-          </div>
-          <div className="flex items-center gap-3 px-3.5 py-2.5">
-            <span className={`font-mono text-2xl font-bold tabular-nums ${done ? "text-emerald-600" : "text-gray-900"}`}>
-              {done ? "0:00" : fmtClock(remaining)}
-            </span>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs text-gray-500 truncate">{done ? "Rest done — go" : `Resting · ${state.label}`}</p>
-            </div>
-            {!done && (
-              <>
-                <button onClick={() => addTime(15)} className="text-xs font-semibold text-gray-500 bg-gray-100 rounded-md px-2 py-1.5">
-                  +15s
-                </button>
-                <button onClick={state.paused ? resume : pause} className="text-gray-900 bg-gray-100 rounded-md p-1.5">
-                  {state.paused ? <Play size={15} /> : <Pause size={15} />}
-                </button>
-              </>
-            )}
-            <button onClick={dismiss} className="text-gray-900 bg-gray-100 rounded-md p-1.5">
-              {done ? <X size={15} /> : <SkipForward size={15} />}
-            </button>
-          </div>
+    <svg
+      className="fixed inset-0 z-40 pointer-events-none"
+      width="100%"
+      height="100%"
+      viewBox={`0 0 ${w} ${h}`}
+      fill="none"
+      aria-hidden="true"
+    >
+      {/* Track — the full loop, faint, so you can see how much has already gone. */}
+      <rect
+        x={edge} y={edge} width={boxW} height={boxH} rx={r} ry={r}
+        stroke={done ? "#059669" : "#F3E6EF"}
+        strokeWidth={RING_WIDTH}
+        className={done ? "animate-pulse" : ""}
+      />
+      {/* Remaining time. The dash is the live arc; the gap is long enough to never repeat. */}
+      {!done && (
+        <rect
+          x={edge} y={edge} width={boxW} height={boxH} rx={r} ry={r}
+          stroke="#410038"
+          strokeWidth={RING_WIDTH}
+          strokeLinecap="round"
+          strokeDasharray={`${perim * fractionLeft} ${perim}`}
+        />
+      )}
+    </svg>
+  );
+}
+
+// Sits in normal document flow at the very top of the page, so scrolling to the top of the
+// workout reveals it — it reads as the edge ring unrolling into a label.
+function RestReadout({ timer }) {
+  const { state, remaining, pause, resume, addTime, dismiss } = timer;
+  if (!state) return null;
+  const done = remaining <= 0;
+
+  return (
+    <div className="px-3 pt-2">
+      <div
+        className={`flex items-center gap-3 rounded-xl border px-3.5 py-2.5 ${
+          done ? "bg-emerald-50 border-emerald-300" : "bg-maroon-50 border-maroon-200"
+        }`}
+      >
+        <span className={`font-mono text-3xl font-bold tabular-nums ${done ? "text-emerald-600" : "text-maroon-600"}`}>
+          {done ? "0:00" : fmtClock(remaining)}
+        </span>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm text-gray-500 truncate">{done ? "Rest done — go" : `Resting · ${state.label}`}</p>
         </div>
+        {!done && (
+          <>
+            <button onClick={() => addTime(15)} className="text-sm font-semibold text-gray-500 bg-white rounded-md px-2 py-1.5">
+              +15s
+            </button>
+            <button onClick={state.paused ? resume : pause} className="text-gray-900 bg-white rounded-md p-1.5">
+              {state.paused ? <Play size={17} /> : <Pause size={17} />}
+            </button>
+          </>
+        )}
+        <button onClick={dismiss} className="text-gray-900 bg-white rounded-md p-1.5">
+          {done ? <X size={17} /> : <SkipForward size={17} />}
+        </button>
       </div>
     </div>
   );
@@ -453,7 +528,7 @@ function QuickTimer({ timer }) {
                 key={p}
                 onClick={() => setCustomLen(p)}
                 className={`text-xs font-mono px-2.5 py-1.5 rounded-md ${
-                  customLen === p ? "bg-orange-600 text-white" : "bg-white text-gray-500 border border-gray-200"
+                  customLen === p ? "bg-maroon-600 text-white" : "bg-white text-gray-500 border border-gray-200"
                 }`}
               >
                 {p}s
@@ -726,7 +801,7 @@ function CoachPanel({ analysis, onStart }) {
     return (
       <button
         onClick={onStart}
-        className="w-full mb-5 flex items-center justify-center gap-2 rounded-xl border border-dashed border-orange-300 bg-orange-50 text-orange-700 text-sm font-semibold py-3"
+        className="w-full mb-5 flex items-center justify-center gap-2 rounded-xl border border-dashed border-maroon-300 bg-maroon-50 text-maroon-700 text-sm font-semibold py-3"
       >
         <Sparkles size={15} /> Start Workout — check last session
       </button>
@@ -736,7 +811,7 @@ function CoachPanel({ analysis, onStart }) {
   return (
     <div className="mb-5 rounded-xl bg-gray-900 text-white px-4 py-3.5">
       <div className="flex items-center gap-1.5 mb-1.5">
-        <Sparkles size={13} className="text-orange-400" />
+        <Sparkles size={13} className="text-maroon-400" />
         <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">Coach</p>
       </div>
       <p className="text-sm leading-snug">{analysis.overall}</p>
@@ -860,7 +935,7 @@ function LogView({ onSave, timer, sessions }) {
             key={d}
             onClick={() => changeDay(d)}
             className={`rounded-lg py-2 text-xs font-semibold leading-tight transition-colors ${
-              day === d ? "bg-orange-600 text-white" : "bg-gray-100 text-gray-500"
+              day === d ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-500"
             }`}
           >
             {d}
@@ -881,7 +956,7 @@ function LogView({ onSave, timer, sessions }) {
             value={date}
             onChange={(e) => setDate(e.target.value)}
             style={{ colorScheme: "light" }}
-            className="w-full bg-gray-100 rounded-md px-3 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-orange-600"
+            className="w-full bg-gray-100 rounded-md px-3 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
           />
         </label>
         <label className="w-28">
@@ -892,7 +967,7 @@ function LogView({ onSave, timer, sessions }) {
             value={duration}
             onChange={(e) => setDuration(e.target.value)}
             placeholder="47"
-            className="w-full bg-gray-100 rounded-md px-3 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-orange-600"
+            className="w-full bg-gray-100 rounded-md px-3 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
           />
         </label>
       </div>
@@ -929,7 +1004,7 @@ function LogView({ onSave, timer, sessions }) {
         onClick={handleSave}
         disabled={!canSave}
         className={`w-full mt-5 flex items-center justify-center gap-2 rounded-lg py-3 text-sm font-semibold transition-colors ${
-          canSave ? "bg-orange-600 text-white active:bg-orange-700" : "bg-gray-100 text-gray-400"
+          canSave ? "bg-maroon-600 text-white active:bg-maroon-700" : "bg-gray-100 text-gray-400"
         }`}
       >
         {justSaved ? "Saved ✓" : (
@@ -942,6 +1017,70 @@ function LogView({ onSave, timer, sessions }) {
   );
 }
 
+// ---------- Keyboard accessory bar ----------
+// iOS's numeric and decimal keypads have no return key at all, so `enterkeyhint` can't give
+// us a "next" or a "done" — there is no key to put the hint on. The only way to get a tab
+// key on a phone is to draw one ourselves directly above the keyboard, which means knowing
+// where the keyboard is: visualViewport is the one API that tells us.
+function useKeyboardOffset() {
+  const [offset, setOffset] = useState(0);
+  useEffect(() => {
+    const vv = typeof window !== "undefined" ? window.visualViewport : null;
+    if (!vv) return;
+    // How much of the layout viewport is currently covered from the bottom — the keyboard
+    // plus any browser chrome. Pinning the bar to this keeps it flush with the key tops.
+    const update = () => setOffset(Math.max(0, window.innerHeight - vv.height - vv.offsetTop));
+    update();
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    return () => {
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+    };
+  }, []);
+  return offset;
+}
+
+function KeyboardAccessory({ label, actionLabel, actionIcon, onAction, onDone, disabled }) {
+  const offset = useKeyboardOffset();
+  if (typeof document === "undefined") return null;
+
+  // Portalled to <body> so no card's overflow or stacking context can clip it.
+  return createPortal(
+    <div className="fixed inset-x-0 z-50" style={{ bottom: offset }}>
+      <div className="max-w-md mx-auto flex items-center gap-2 bg-gray-100 border-t border-gray-300 px-3 py-2 shadow-lg">
+        <span className="flex-1 min-w-0 truncate text-sm text-gray-500">{label}</span>
+        {/* preventDefault on mousedown keeps focus in the input, so the keyboard doesn't
+            flicker shut and reopen between fields. */}
+        <button
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onDone}
+          className="text-sm font-semibold text-gray-600 bg-white border border-gray-300 rounded-md px-3 py-2"
+        >
+          Done
+        </button>
+        <button
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onAction}
+          disabled={disabled}
+          className={`flex items-center gap-1.5 text-sm font-semibold rounded-md px-4 py-2 ${
+            disabled ? "bg-gray-300 text-gray-500" : "bg-maroon-600 text-white"
+          }`}
+        >
+          {actionLabel} {actionIcon}
+        </button>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// iOS decimal keypads emit a comma as the separator in some locales.
+function toNumber(v) {
+  const n = Number(String(v).replace(",", ".").trim());
+  return Number.isFinite(n) ? n : NaN;
+}
+
 function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }) {
   const [weight, setWeight] = useState("");
   const [reps, setReps] = useState("");
@@ -951,12 +1090,60 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
   const [dropWeight, setDropWeight] = useState("");
   const [dropReps, setDropReps] = useState("");
 
+  // Which of this card's set-entry fields has the keyboard, so we know what the accessory
+  // bar's action button should do. Only the focused card renders a bar.
+  const [focusField, setFocusField] = useState(null); // null | "weight" | "reps"
+  const weightRef = useRef(null);
+  const repsRef = useRef(null);
+  const blurTimer = useRef(null);
+
+  useEffect(() => () => clearTimeout(blurTimer.current), []);
+
+  function handleFieldFocus(field, el) {
+    clearTimeout(blurTimer.current);
+    setFocusField(field);
+    // The accessory bar sits right on top of the keyboard, and iOS only guarantees the
+    // focused input is above the keyboard — not above our bar. Centre it so it can't hide.
+    setTimeout(() => {
+      try { el.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) { /* older webview */ }
+    }, 300);
+  }
+
+  // Tapping from weight to reps blurs before it focuses; the delay lets the incoming focus
+  // cancel the teardown so the bar doesn't flash away between fields.
+  function handleFieldBlur() {
+    clearTimeout(blurTimer.current);
+    blurTimer.current = setTimeout(() => setFocusField(null), 150);
+  }
+
+  const weightNum = toNumber(weight);
+  const repsNum = toNumber(reps);
+  const canAddSet = weight !== "" && reps !== "" && !Number.isNaN(weightNum) && !Number.isNaN(repsNum);
+
   function addSet() {
-    if (weight === "" || reps === "") return;
-    const set = { weight: Number(weight), reps: Number(reps) };
+    if (!canAddSet) return;
+    const set = { weight: weightNum, reps: repsNum };
     onChange({ ...exercise, sets: [...exercise.sets, set] });
     setReps("");
     timer.start(restLen, exercise.name);
+  }
+
+  function goToReps() {
+    const el = repsRef.current;
+    if (!el) return;
+    el.focus();
+    // Select rather than clear, so the previous set's rep count is a one-tap repeat.
+    try { el.select(); } catch (e) { /* not selectable in this engine */ }
+  }
+
+  // "Record the set" from the keyboard bar: log it, then drop the keyboard so the set list
+  // and the rest ring are visible — you're about to rest, not type.
+  function recordFromKeyboard() {
+    if (!canAddSet) return;
+    addSet();
+    clearTimeout(blurTimer.current);
+    setFocusField(null);
+    if (repsRef.current) repsRef.current.blur();
   }
 
   function removeSet(i) {
@@ -976,9 +1163,11 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
 
   function addDrop(i) {
     if (dropWeight === "" || dropReps === "") return;
+    if (Number.isNaN(toNumber(dropWeight)) || Number.isNaN(toNumber(dropReps))) return;
     const newSets = exercise.sets.map((s, si) => {
       if (si !== i) return s;
-      const drops = s.drops ? [...s.drops, { weight: Number(dropWeight), reps: Number(dropReps) }] : [{ weight: Number(dropWeight), reps: Number(dropReps) }];
+      const drop = { weight: toNumber(dropWeight), reps: toNumber(dropReps) };
+      const drops = s.drops ? [...s.drops, drop] : [drop];
       return { ...s, drops };
     });
     onChange({ ...exercise, sets: newSets });
@@ -1023,20 +1212,20 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
             target="_blank"
             rel="noopener noreferrer"
             onClick={(e) => e.stopPropagation()}
-            className="flex items-center gap-1 text-xs font-semibold text-orange-600 bg-orange-50 rounded-md px-2 py-1.5 shrink-0 mr-1"
+            className="flex items-center gap-1 text-xs font-semibold text-maroon-600 bg-maroon-50 rounded-md px-2 py-1.5 shrink-0 mr-1"
           >
             <ExternalLink size={11} /> Form
           </a>
         )}
-        <button onClick={onRemove} className="text-gray-500 hover:text-orange-600 bg-gray-100 rounded-md p-1.5 shrink-0">
+        <button onClick={onRemove} className="text-gray-500 hover:text-maroon-600 bg-gray-100 rounded-md p-1.5 shrink-0">
           <X size={14} />
         </button>
       </div>
 
       {coachNote && (
-        <div className="mx-3.5 mb-3 flex items-start gap-1.5 rounded-md bg-orange-50 border border-orange-100 px-2.5 py-2">
-          <Sparkles size={12} className="text-orange-500 shrink-0 mt-0.5" />
-          <p className="text-xs text-orange-800 leading-snug">{coachNote}</p>
+        <div className="mx-3.5 mb-3 flex items-start gap-1.5 rounded-md bg-maroon-50 border border-maroon-100 px-2.5 py-2">
+          <Sparkles size={12} className="text-maroon-500 shrink-0 mt-0.5" />
+          <p className="text-xs text-maroon-800 leading-snug">{coachNote}</p>
         </div>
       )}
 
@@ -1047,7 +1236,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
               value={exercise.name}
               onChange={(e) => renameExercise(e.target.value)}
               placeholder="Exercise name"
-              className="w-full mb-2 bg-white rounded-md px-2.5 py-1.5 text-xs text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-orange-600"
+              className="w-full mb-2 bg-white rounded-md px-2.5 py-1.5 text-xs text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
             />
           )}
 
@@ -1063,7 +1252,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
                         <button
                           key={di}
                           onClick={() => removeDrop(i, di)}
-                          className="text-orange-600"
+                          className="text-maroon-600"
                           title="Tap to remove this drop"
                         >
                           {" → "}{d.weight}<span className="text-gray-500 text-xs">kg</span>×{d.reps}
@@ -1072,13 +1261,13 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
                     </span>
                     <button
                       onClick={() => toggleDropForm(i)}
-                      className={`flex items-center shrink-0 rounded-md p-1 ${dropFormFor === i ? "bg-orange-100 text-orange-600" : "bg-gray-100 text-gray-500"}`}
+                      className={`flex items-center shrink-0 rounded-md p-1 ${dropFormFor === i ? "bg-maroon-100 text-maroon-600" : "bg-gray-100 text-gray-500"}`}
                       title="Add a drop set"
                     >
                       <ArrowDown size={11} />
                       <Plus size={9} className="-ml-0.5" />
                     </button>
-                    <button onClick={() => removeSet(i)} className="text-gray-500 hover:text-orange-600 bg-gray-100 rounded-md p-1 shrink-0">
+                    <button onClick={() => removeSet(i)} className="text-gray-500 hover:text-maroon-600 bg-gray-100 rounded-md p-1 shrink-0">
                       <Trash2 size={13} />
                     </button>
                   </div>
@@ -1086,26 +1275,29 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
                   {dropFormFor === i && (
                     <div className="flex items-center gap-1.5 mt-2 pl-10">
                       <input
-                        type="number"
+                        type="text"
                         inputMode="decimal"
+                        autoComplete="off"
                         value={dropWeight}
                         onChange={(e) => setDropWeight(e.target.value)}
                         placeholder="kg"
-                        className="w-14 bg-gray-50 rounded-md px-2 py-1.5 text-sm text-center font-mono border border-gray-200 focus:outline-none focus:ring-1 focus:ring-orange-600"
+                        className="w-16 bg-gray-50 rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
                       />
-                      <span className="text-gray-400 text-xs">×</span>
+                      <span className="text-gray-400 text-sm">×</span>
                       <input
-                        type="number"
+                        type="text"
                         inputMode="numeric"
+                        pattern="[0-9]*"
+                        autoComplete="off"
                         value={dropReps}
                         onChange={(e) => setDropReps(e.target.value)}
                         placeholder="reps"
-                        className="w-14 bg-gray-50 rounded-md px-2 py-1.5 text-sm text-center font-mono border border-gray-200 focus:outline-none focus:ring-1 focus:ring-orange-600"
+                        className="w-16 bg-gray-50 rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
                         onKeyDown={(e) => e.key === "Enter" && addDrop(i)}
                       />
                       <button
                         onClick={() => addDrop(i)}
-                        className="flex-1 bg-orange-50 text-orange-600 text-xs font-semibold rounded-md py-1.5"
+                        className="flex-1 bg-maroon-50 text-maroon-600 text-xs font-semibold rounded-md py-1.5"
                       >
                         Add drop
                       </button>
@@ -1128,36 +1320,68 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
               onChange={(e) => updateNotes(e.target.value)}
               placeholder="e.g. seat height 4, felt it in shoulders not back…"
               rows={2}
-              className="w-full resize-none bg-gray-50 rounded-md px-2.5 py-1.5 text-xs text-gray-900 placeholder-gray-400 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-orange-600"
+              className="w-full resize-none bg-gray-50 rounded-md px-2.5 py-1.5 text-xs text-gray-900 placeholder-gray-400 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
             />
           </div>
 
           <div className="flex gap-1.5 mb-2">
+            {/* type="text" + inputMode="decimal", NOT type="number": on iOS a number input
+                shows a keypad whose decimal point is present but dead, so 7.5 kg can't be
+                entered at all. text/decimal gives a live dot. Values are parsed by hand. */}
             <input
-              type="number"
+              ref={weightRef}
+              type="text"
               inputMode="decimal"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck="false"
               value={weight}
               onChange={(e) => setWeight(e.target.value)}
+              onFocus={(e) => handleFieldFocus("weight", e.target)}
+              onBlur={handleFieldBlur}
               placeholder="kg"
-              className="w-16 bg-white rounded-md px-2 py-1.5 text-sm text-center font-mono border border-gray-200 focus:outline-none focus:ring-1 focus:ring-orange-600"
+              className="w-20 bg-white rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
             />
-            <span className="self-center text-gray-400 text-xs">×</span>
+            <span className="self-center text-gray-400 text-sm">×</span>
             <input
-              type="number"
+              ref={repsRef}
+              type="text"
               inputMode="numeric"
+              pattern="[0-9]*"
+              autoComplete="off"
               value={reps}
               onChange={(e) => setReps(e.target.value)}
+              onFocus={(e) => handleFieldFocus("reps", e.target)}
+              onBlur={handleFieldBlur}
               placeholder="reps"
-              className="w-16 bg-white rounded-md px-2 py-1.5 text-sm text-center font-mono border border-gray-200 focus:outline-none focus:ring-1 focus:ring-orange-600"
+              className="w-20 bg-white rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
               onKeyDown={(e) => e.key === "Enter" && addSet()}
             />
             <button
               onClick={addSet}
-              className="flex-1 flex items-center justify-center gap-1 bg-gray-100 rounded-md text-xs font-semibold text-gray-900 hover:bg-gray-200 transition-colors"
+              className="flex-1 flex items-center justify-center gap-1 bg-gray-100 rounded-md text-sm font-semibold text-gray-900 hover:bg-gray-200 transition-colors"
             >
-              <Plus size={13} /> Add set + rest
+              <Plus size={15} /> Add set + rest
             </button>
           </div>
+
+          {/* The phone equivalent of tab-then-enter: weight → reps → record, without
+              reaching for the screen between fields. */}
+          {focusField && (
+            <KeyboardAccessory
+              label={`${exercise.name} · ${focusField === "weight" ? "weight in kg" : "reps"}`}
+              actionLabel={focusField === "weight" ? "Next" : "Record the set"}
+              actionIcon={focusField === "weight" ? <SkipForward size={15} /> : <Check size={15} />}
+              onAction={focusField === "weight" ? goToReps : recordFromKeyboard}
+              onDone={() => {
+                clearTimeout(blurTimer.current);
+                setFocusField(null);
+                if (weightRef.current) weightRef.current.blur();
+                if (repsRef.current) repsRef.current.blur();
+              }}
+              disabled={focusField === "reps" && !canAddSet}
+            />
+          )}
 
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-xs text-gray-400 mr-0.5">Rest timer:</span>
@@ -1166,7 +1390,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
                 key={r}
                 onClick={() => setRestLen(r)}
                 className={`text-xs font-mono px-2 py-1 rounded ${
-                  restLen === r ? "bg-orange-600 text-white" : "bg-white text-gray-500 border border-gray-200"
+                  restLen === r ? "bg-maroon-600 text-white" : "bg-white text-gray-500 border border-gray-200"
                 }`}
               >
                 {r}s
@@ -1175,7 +1399,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
           </div>
           <button
             onClick={() => timer.start(restLen, exercise.name)}
-            className="w-full mt-1.5 flex items-center justify-center gap-1.5 bg-orange-50 text-orange-600 text-xs font-semibold rounded-md py-1.5"
+            className="w-full mt-1.5 flex items-center justify-center gap-1.5 bg-maroon-50 text-maroon-600 text-xs font-semibold rounded-md py-1.5"
           >
             <RotateCcw size={12} /> Start rest timer now
           </button>
@@ -1230,7 +1454,7 @@ function HistoryView({ sessions, onDelete }) {
                     <div className="flex items-center gap-2 mb-1">
                       <p className="text-xs font-semibold text-gray-900">{e.name}</p>
                       {e.link && (
-                        <a href={e.link} target="_blank" rel="noopener noreferrer" className="text-orange-600">
+                        <a href={e.link} target="_blank" rel="noopener noreferrer" className="text-maroon-600">
                           <ExternalLink size={11} />
                         </a>
                       )}
@@ -1240,7 +1464,7 @@ function HistoryView({ sessions, onDelete }) {
                         <span key={si} className="font-mono text-xs tabular-nums bg-white rounded px-2 py-1 text-gray-700">
                           {set.weight}kg×{set.reps}
                           {(set.drops || []).map((d, di) => (
-                            <span key={di} className="text-orange-600">{" → "}{d.weight}kg×{d.reps}</span>
+                            <span key={di} className="text-maroon-600">{" → "}{d.weight}kg×{d.reps}</span>
                           ))}
                         </span>
                       ))}
@@ -1250,7 +1474,7 @@ function HistoryView({ sessions, onDelete }) {
                 ))}
                 <button
                   onClick={() => onDelete(s.id)}
-                  className="mt-1 flex items-center gap-1.5 text-xs text-gray-500 hover:text-orange-600"
+                  className="mt-1 flex items-center gap-1.5 text-xs text-gray-500 hover:text-maroon-600"
                 >
                   <Trash2 size={12} /> Delete session
                 </button>
@@ -1277,9 +1501,11 @@ function ProfileView({ profile, onSave }) {
     String(displayName) !== String(profile.displayName ?? "");
 
   async function handleSave() {
+    const h = toNumber(heightCm);
+    const w = toNumber(weightKg);
     await onSave({
-      heightCm: heightCm === "" ? "" : Number(heightCm),
-      weightKg: weightKg === "" ? "" : Number(weightKg),
+      heightCm: heightCm === "" || Number.isNaN(h) ? "" : h,
+      weightKg: weightKg === "" || Number.isNaN(w) ? "" : w,
       displayName: displayName.trim(),
     });
     setJustSaved(true);
@@ -1301,18 +1527,21 @@ function ProfileView({ profile, onSave }) {
             value={heightCm}
             onChange={(e) => setHeightCm(e.target.value)}
             placeholder="186"
-            className="w-full bg-white rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-orange-600"
+            className="w-full bg-white rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
           />
         </label>
         <label className="block">
           <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Weight (kg)</span>
+          {/* text/decimal, not number — see the set-entry inputs: iOS renders a dead
+              decimal point on number inputs, so 76.5 kg would be unenterable. */}
           <input
-            type="number"
+            type="text"
             inputMode="decimal"
+            autoComplete="off"
             value={weightKg}
             onChange={(e) => setWeightKg(e.target.value)}
             placeholder="76"
-            className="w-full bg-white rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-orange-600"
+            className="w-full bg-white rounded-md px-3 py-2.5 text-base text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
           />
         </label>
         <label className="block">
@@ -1325,14 +1554,14 @@ function ProfileView({ profile, onSave }) {
             onChange={(e) => setDisplayName(e.target.value)}
             placeholder="e.g. Ramazan"
             maxLength={24}
-            className="w-full bg-white rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-orange-600"
+            className="w-full bg-white rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
           />
         </label>
         <button
           onClick={handleSave}
           disabled={!dirty && !justSaved}
           className={`w-full flex items-center justify-center gap-2 rounded-lg py-3 text-sm font-semibold transition-colors ${
-            dirty ? "bg-orange-600 text-white" : "bg-gray-100 text-gray-400"
+            dirty ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-400"
           }`}
         >
           {justSaved ? "Saved ✓" : (
@@ -1343,8 +1572,8 @@ function ProfileView({ profile, onSave }) {
         </button>
       </div>
 
-      <div className="mt-5 rounded-xl bg-orange-50 border border-orange-100 px-4 py-3">
-        <p className="text-xs text-orange-800 leading-snug">
+      <div className="mt-5 rounded-xl bg-maroon-50 border border-maroon-100 px-4 py-3">
+        <p className="text-xs text-maroon-800 leading-snug">
           Height and weight stay private, used only for your own rating math and coach suggestions. Your display name and current rating (not your actual workout logs, sets, or notes) are shared publicly on the leaderboard with anyone who has this artifact's link — leave the name blank to opt out.
         </p>
       </div>
@@ -1360,7 +1589,7 @@ function RatingCard({ eloResult, profile }) {
     return (
       <div className="mb-5 rounded-xl bg-gray-900 text-white px-4 py-4">
         <div className="flex items-center gap-1.5 mb-1.5">
-          <Award size={14} className="text-orange-400" />
+          <Award size={14} className="text-maroon-400" />
           <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">Rating</p>
         </div>
         <p className="text-sm text-gray-300">Add your weight in the Profile tab to unlock your rating.</p>
@@ -1384,7 +1613,7 @@ function RatingCard({ eloResult, profile }) {
   return (
     <div className="mb-5 rounded-xl bg-gray-900 text-white px-4 py-4">
       <div className="flex items-center gap-1.5 mb-2">
-        <Award size={14} className="text-orange-400" />
+        <Award size={14} className="text-maroon-400" />
         <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">Rating</p>
       </div>
 
@@ -1392,7 +1621,7 @@ function RatingCard({ eloResult, profile }) {
         <span className="font-mono text-4xl font-bold tabular-nums leading-none">{trajectory.length ? rating : RATING_BASELINE}</span>
         <span className={`text-xs font-semibold px-2 py-1 rounded ${tier.bg} ${tier.color}`}>{tier.name}</span>
         {trajectory.length > 1 && change !== 0 && (
-          <span className={`text-xs font-semibold ml-auto mb-1 ${change > 0 ? "text-emerald-400" : "text-orange-400"}`}>
+          <span className={`text-xs font-semibold ml-auto mb-1 ${change > 0 ? "text-emerald-400" : "text-maroon-400"}`}>
             {change > 0 ? "+" : ""}{change}
           </span>
         )}
@@ -1404,7 +1633,7 @@ function RatingCard({ eloResult, profile }) {
 
       {hadLayoff && (
         <div className="mt-2 flex items-center gap-1.5 rounded-md bg-gray-700 px-2.5 py-1.5">
-          <p className="text-xs text-orange-300">
+          <p className="text-xs text-maroon-300">
             {lastEntry.gapDays}-day gap since your last session — rating dropped {lastEntry.layoffPenalty} pts for the layoff, before this session even counted.
           </p>
         </div>
@@ -1413,7 +1642,7 @@ function RatingCard({ eloResult, profile }) {
       {next && trajectory.length > 0 && (
         <div className="mt-3">
           <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
-            <div className="h-full bg-orange-500 rounded-full" style={{ width: `${pctToNext * 100}%` }} />
+            <div className="h-full bg-maroon-500 rounded-full" style={{ width: `${pctToNext * 100}%` }} />
           </div>
           <p className="text-xs text-gray-400 mt-1.5">{next.min - rating > 0 ? `${next.min - rating} to ${next.name}` : `Ready for ${next.name}`}</p>
         </div>
@@ -1423,7 +1652,7 @@ function RatingCard({ eloResult, profile }) {
         <div className="h-24 mt-3 -ml-2">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={trajectory} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
-              <Line type="monotone" dataKey="rating" stroke="#fb923c" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="rating" stroke="#C99CBC" strokeWidth={2} dot={false} />
               <Tooltip
                 contentStyle={{ background: "#111827", border: "1px solid #374151", borderRadius: 8, fontSize: 11 }}
                 labelStyle={{ color: "#9ca3af" }}
@@ -1530,7 +1759,7 @@ function Leaderboard({ displayName, rating, tierName }) {
   return (
     <div className="mb-5 rounded-xl bg-gray-50 border border-gray-200 px-4 py-3.5">
       <div className="flex items-center gap-1.5 mb-2.5">
-        <Users size={13} className="text-orange-600" />
+        <Users size={13} className="text-maroon-600" />
         <p className="text-xs uppercase tracking-wider text-gray-500 font-semibold">Leaderboard</p>
       </div>
 
@@ -1544,7 +1773,7 @@ function Leaderboard({ displayName, rating, tierName }) {
             <div
               key={e.name + i}
               className={`flex items-center justify-between rounded-md px-2.5 py-1.5 border ${
-                e.me ? "bg-orange-50 border-orange-200" : "bg-white border-gray-100"
+                e.me ? "bg-maroon-50 border-maroon-200" : "bg-white border-gray-100"
               }`}
             >
               <span className="text-xs font-semibold text-gray-700 truncate">
@@ -1559,7 +1788,7 @@ function Leaderboard({ displayName, rating, tierName }) {
       <div className="flex gap-1.5">
         <button
           onClick={shareCard}
-          className="flex-1 flex items-center justify-center gap-1.5 bg-orange-600 text-white text-xs font-semibold rounded-md py-2"
+          className="flex-1 flex items-center justify-center gap-1.5 bg-maroon-600 text-white text-xs font-semibold rounded-md py-2"
         >
           <Share2 size={12} /> {copied ? "Copied!" : "Share my score"}
         </button>
@@ -1578,12 +1807,12 @@ function Leaderboard({ displayName, rating, tierName }) {
             onChange={(e) => { setPasteVal(e.target.value); setPasteErr(""); }}
             rows={2}
             placeholder="Paste their GAINS|... line here"
-            className="w-full resize-none bg-white rounded-md px-2.5 py-2 text-xs text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-orange-600"
+            className="w-full resize-none bg-white rounded-md px-2.5 py-2 text-xs text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
           <button onClick={addRival} className="w-full mt-1.5 bg-gray-900 text-white text-xs font-semibold rounded-md py-2">
             Add to leaderboard
           </button>
-          {pasteErr && <p className="text-xs text-orange-600 mt-1.5">{pasteErr}</p>}
+          {pasteErr && <p className="text-xs text-maroon-600 mt-1.5">{pasteErr}</p>}
         </div>
       )}
 
@@ -1661,7 +1890,7 @@ function ProgressView({ sessions, profile }) {
         value={selected}
         onChange={(e) => setSelected(e.target.value)}
         style={{ colorScheme: "light" }}
-        className="w-full bg-gray-100 rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 mb-4 focus:outline-none focus:ring-2 focus:ring-orange-600"
+        className="w-full bg-gray-100 rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 mb-4 focus:outline-none focus:ring-2 focus:ring-maroon-600"
       >
         {exerciseNames.map((n) => (
           <option key={n} value={n}>{n}</option>
@@ -1674,7 +1903,7 @@ function ProgressView({ sessions, profile }) {
             <span className="font-mono text-3xl font-bold tabular-nums">{latest.topWeight}</span>
             <span className="text-sm text-gray-500">kg top set</span>
             {delta !== 0 && (
-              <span className={`text-xs font-semibold ml-auto ${delta > 0 ? "text-emerald-600" : "text-orange-600"}`}>
+              <span className={`text-xs font-semibold ml-auto ${delta > 0 ? "text-emerald-600" : "text-maroon-600"}`}>
                 {delta > 0 ? "+" : ""}{delta}kg since first log
               </span>
             )}
@@ -1690,7 +1919,7 @@ function ProgressView({ sessions, profile }) {
                   contentStyle={{ background: "#F7F7F8", border: "1px solid #E2E4E8", borderRadius: 8, fontSize: 12 }}
                   labelStyle={{ color: "#6B7280" }}
                 />
-                <Line type="monotone" dataKey="topWeight" stroke="#FF5A36" strokeWidth={2.5} dot={{ fill: "#FF5A36", r: 3 }} />
+                <Line type="monotone" dataKey="topWeight" stroke="#410038" strokeWidth={2.5} dot={{ fill: "#410038", r: 3 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>

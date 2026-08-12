@@ -15,7 +15,7 @@ const text = rootText(w);
 
 check("renders something into #root", text.length > 0);
 check("no console errors on mount", errs.length === 0, errs.slice(0, 3).join(" | "));
-check("shows the app header", text.includes("Iron") && text.includes("Training Log"));
+check("shows the app header", text.includes("Chetamba") && text.includes("Training Log"));
 check("shows all four tabs", ["Log", "History", "Progress", "Profile"].every((t) => text.includes(t)));
 check("defaults to the Log tab with Upper A", text.includes("Upper A"));
 check("renders the first exercise of the split", text.includes("Dumbbell Bench Press"));

@@ -1,12 +1,13 @@
 # workout_tracker.md
 
-Handover doc for **Gains** — a workout tracker running as a Telegram Mini App.
+Handover doc for **Chetamba** — a workout tracker running as a Telegram Mini App.
 
 > **For Claude Code:** this file is the source of truth for the project. Read it before
 > changing anything. **Update it in the same commit as any change** — see
 > [Maintaining this doc](#maintaining-this-doc) at the bottom.
 
 Last updated: 2026-08-12 · Status: builds clean, all three suites green, **not yet deployed**
+· Next up: [editable exercises](#12-next-session--editable--custom-exercises)
 
 ---
 
@@ -101,20 +102,23 @@ Roughly in file order:
 
 | Lines | Section |
 |---|---|
-| 1–3 | Imports (react, lucide-react, recharts) |
-| ~7–51 | `PROGRAM` — the 4-day split, exercise definitions and form links |
-| ~53–105 | Rating config: `EXERCISE_META`, `TIERS`, tuning constants |
-| ~107–190 | **Telegram bridge + storage layer** (§5) |
-| ~193–260 | `emptyExerciseLog`, `playBeep`, `useRestTimer` |
-| ~261–350 | `App` — tab state, loads sessions/profile, save handlers |
-| ~351–495 | `Header`, `BottomNav`, `RestTimerBar`, `QuickTimer` |
-| ~498–630 | **Rating engine** (§6) |
-| ~646–722 | **Local coach** (§7) |
-| ~724–945 | `CoachPanel`, `LogView` (incl. draft autosave) |
-| ~945–1188 | `ExerciseCard` — sets, drop sets, notes, per-exercise rest |
-| ~1189–1355 | `HistoryView`, `ProfileView` |
-| ~1356–1590 | `RatingCard`, **Leaderboard** (§8) |
-| ~1590+ | `ProgressView` — rating card, leaderboard, per-exercise charts |
+| 1–4 | Imports (react, react-dom/client portal, lucide-react, recharts) |
+| ~8–62 | `PROGRAM` — the 4-day split, exercise definitions and form links |
+| ~64–105 | Rating config: `EXERCISE_META`, `TIERS`, tuning constants |
+| ~109–192 | **Telegram bridge + storage layer** (§5) |
+| ~195–260 | `emptyExerciseLog`, `playBeep`, `useRestTimer` |
+| ~263–355 | `App` — tab state, loads sessions/profile, save handlers |
+| ~356–405 | `Header`, `BottomNav` |
+| ~406–510 | **Rest timer UI**: `useViewportBox`, `RestRing`, `RestReadout` (§9a) |
+| ~513–570 | `QuickTimer` |
+| ~573–705 | **Rating engine** (§6) |
+| ~721–795 | **Local coach** (§7) |
+| ~799–1020 | `CoachPanel`, `LogView` (incl. draft autosave) |
+| ~1025–1082 | **Keyboard accessory bar**: `useKeyboardOffset`, `KeyboardAccessory`, `toNumber` (§9b) |
+| ~1084–1410 | `ExerciseCard` — sets, drop sets, notes, per-exercise rest |
+| ~1413–1580 | `HistoryView`, `ProfileView` |
+| ~1585–1820 | `RatingCard`, **Leaderboard** (§8) |
+| ~1826+ | `ProgressView` — rating card, leaderboard, per-exercise charts |
 
 Line numbers drift as the file changes; treat them as a map, not gospel. Grep for the
 function name.
@@ -253,26 +257,90 @@ scope change, not a bug fix.
 
 ---
 
-## 9. Styling constraints
+## 9. Styling and phone-input constraints
 
-`dist/index.html` loads the **Tailwind Play CDN**, which compiles at runtime, so
-arbitrary values like `bg-[#FF5A36]` *do* work here.
+`dist/index.html` loads the **Tailwind Play CDN**, which compiles at runtime.
 
-⚠️ The source currently uses **only core Tailwind classes** because the previous Claude
-artifact environment had no JIT compiler and arbitrary values silently rendered as
-nothing — an invisible-buttons bug that took several rounds to find. The current code is
-therefore safe in both environments. If you introduce arbitrary values, the app will
-still work on Telegram, but the code stops being portable back to an artifact.
+### Brand colour
+
+The accent is **maroon `#410038`**, defined as a `maroon-*` scale in the
+`tailwind.config` block in `dist/index.html`. Everything accent-coloured uses
+`maroon-50/100/200/300/400/500/600/700/800`; `600` is the brand colour itself.
+
+⚠️ **If that config block is deleted or mistyped, every `maroon-*` class compiles to
+nothing and the buttons turn invisible** — the same failure mode that cost several rounds
+of debugging in the artifact era. There is no test for this, because jsdom never runs
+Tailwind. Check it in a real browser after touching `index.html`. To retune the brand,
+change the scale in one place rather than editing class names.
+
+The one deliberate exception: the **Bronze tier badge stays orange**. It's a metal, not
+the brand accent.
+
+### Sizing
+
+`html { font-size: 18px }` in `dist/index.html` (browser default is 16). Tailwind's type
+*and* spacing scales are both in `rem`, so this one number scales text, padding and gaps
+together. **This is the size dial** — change it rather than rewriting class names.
+
+### Light theme
 
 **Light theme is forced** (`color-scheme: light` on `:root` and on inputs). Telegram's
 webview can inject a dark theme that made native form controls black-on-black. Don't
 remove those declarations.
 
-Layout notes:
-- Bottom padding switches between `pb-24` and `pb-44` depending on whether the rest timer
-  bar is showing, so the timer never covers the Save button. This was a real reported bug.
+### 9a. The rest timer is a screen-edge ring, not a bar
+
+The timer used to be a bar floating above the bottom nav. On a phone the keyboard pushes
+that bar upward and it lands **exactly on top of the weight/reps inputs**, so you can't
+see the number you're typing. Reported as the single most annoying thing in the app.
+
+It is now:
+
+- **`RestRing`** — an SVG rounded-rect stroked around the screen edge, `fixed inset-0`,
+  `pointer-events-none`, drawn from the **layout** viewport (not `visualViewport`, which
+  would reflow the ring around the keyboard and put its bottom edge back over the inputs).
+  The remaining time is `strokeDasharray = "<perim × fraction> <perim>"`, so the loop
+  shrinks as the rest runs down. Turns solid emerald and pulses when done.
+- **`RestReadout`** — the exact `m:ss` plus pause / +15s / skip, in **normal document
+  flow at the very top of the page**. Scroll up to see it. It is not sticky on purpose:
+  anything pinned to an edge is something that can end up over an input again.
+
+Consequences, don't undo them:
+- Bottom padding is a constant `pb-24` (nav clearance). The old `pb-24`/`pb-44` switch
+  existed only to dodge the timer bar and is gone.
+- **Nothing may be added that is fixed to the bottom of the screen** except the nav and
+  the keyboard accessory bar, which is deliberately tied to the keyboard's own position.
+
+### 9b. Phone keyboard rules for numeric fields
+
+Three separate iOS behaviours, all of which have bitten this app:
+
+1. **`type="number"` renders a decimal point that does nothing on iOS.** Entering 7.5 kg
+   was impossible — it had to be logged as 7. All weight fields are therefore
+   `type="text"` + `inputMode="decimal"`, and values are parsed by `toNumber()`, which
+   also normalises the comma some locales' keypads emit. **Do not "tidy" these back to
+   `type="number"`.** Rep fields are `type="text"` + `inputMode="numeric"`.
+2. **The iOS numeric keypad has no return key at all**, so `enterkeyhint` cannot give you
+   a Next or Done — there's no key to put the hint on. `KeyboardAccessory` draws our own
+   toolbar instead, positioned with `visualViewport` (`window.innerHeight - vv.height -
+   vv.offsetTop`), which is the only reliable way to know where the keyboard actually is.
+   Its buttons `preventDefault()` on mousedown so focus never leaves the input and the
+   keyboard doesn't flicker shut between fields.
+3. The bar's action is **"Next" on the weight field** (focuses and selects reps) and
+   **"Record the set" on the reps field** (logs it, starts the rest timer, drops the
+   keyboard). That's the whole point: log a set without moving your finger off the keypad.
+   On focus each input is `scrollIntoView({block:"center"})` after 300 ms, because iOS
+   only guarantees the input clears the *keyboard* — it knows nothing about our bar.
+
+`tests/test-flow.mjs` covers the whole weight → Next → reps → Record path, and asserts the
+fields still request the right keypads.
+
+### Other layout notes
+
 - Avoid `ml-auto` on buttons inside `overflow-hidden` cards — it previously pushed
   buttons outside the clip region and made them invisible.
+- `KeyboardAccessory` renders through a **portal to `document.body`** so no card's
+  overflow or stacking context can clip it.
 
 ---
 
@@ -299,7 +367,7 @@ folder setting is wrong.
 |---|---|
 | `/newbot` | display name, then a username ending in `bot` — save the token it gives you, even though this app doesn't use one |
 | `/newapp` | pick the bot → title, short description, a 640×360 icon, then paste the Pages URL above |
-| `/setmenubutton` | pick the bot → paste the same URL → set the button label (e.g. "Open Gains") |
+| `/setmenubutton` | pick the bot → paste the same URL → set the button label (e.g. "Open Chetamba") |
 
 `/newapp` requires an image; anything 640×360 works, it can be replaced later.
 
@@ -315,8 +383,11 @@ and reopen.
 - [ ] **Never deployed or opened in a real Telegram client.** All testing is jsdom.
       Real-device layout/sizing is unverified, and CloudStorage has never actually run —
       every test so far has exercised the `localStorage` fallback path only.
-- [ ] **The app has two names.** `dist/index.html` sets the title to "Gains"; the in-app
-      `Header` renders "Iron & Ledger". Pick one before telling anyone else about it.
+- [ ] **Verify on device after the UI rework** (2026-08-12): the edge ring, the keyboard
+      accessory bar, and 18px base sizing have only ever run in jsdom. Specifically check
+      that the ring is visible on a notched screen with `viewport-fit=cover`, and that
+      starting a rest timer while scrolled down doesn't jump the page (the readout is
+      inserted at the top of the flow; browser scroll anchoring should absorb it).
 - [ ] **Lower B still has hip thrusts**, which he said he doesn't want. Needs a
       replacement (back extension or a hamstring curl machine) — ask before swapping.
 - [ ] Duration exercises (planks, rowing erg) are logged as seconds in the reps field.
@@ -328,7 +399,53 @@ and reopen.
 
 ---
 
-## 12. Maintaining this doc
+## 12. Next session — editable / custom exercises
+
+Agreed on 2026-08-12 as the next piece of work: **be able to change the exercises in a day
+and add your own.** Right now `PROGRAM` is a hard-coded `const` and the only escape hatch
+is "add custom exercise", which creates an unnamed entry that the rating engine ignores.
+
+This is not a UI job. Four things in the current design assume a fixed program, and each
+one has to be answered before writing code:
+
+**1. Exercises are keyed by display name.** The coach does
+`lastSameDay.exercises.find((e) => e.name === pe.name)`, the charts group by name, and
+`EXERCISE_META` is a name-keyed object. **Rename a lift and its entire history detaches.**
+Editing almost certainly means giving exercises a stable `id` and treating the name as a
+label. That's a storage migration for any session already saved.
+
+**2. `PROGRAM` has to move into CloudStorage.** A new key (`program_v1`) subject to the
+same 4096-char-per-value limit as everything else in §5 — the full 4-day split with links
+and targets will be close to that ceiling, so it probably needs splitting per day
+(`program_UpperA`…). Existing users need a fallback to the built-in default when the key
+is absent.
+
+**3. The rating engine needs a benchmark for a lift it has never heard of.** `EXERCISE_META`
+gives each exercise a `multiplier` (how much it counts) and an `avg` (the "average person"
+benchmark for your bodyweight). A user-added lift has neither. Options, roughly in order of
+how well they fit what he's already asked for:
+
+  - **Ask what it replaces**, and inherit that exercise's meta. Fits the actual use case —
+    the machine he wants is taken, so he swaps in a near-equivalent.
+  - **Pick a movement pattern** (horizontal push / vertical pull / squat / hinge /
+    isolation / core / conditioning) and derive a multiplier and a bodyweight-relative
+    `avg` from the pattern.
+  - **Track-only**: it logs but doesn't score. Simplest, and wrong for the main use case.
+
+**4. The trap: §6 rule 3 says untouched exercises decay toward neutral, so skipping a lift
+slows the climb.** If a swapped-in exercise is treated as *new* rather than as a
+*substitution*, the lift it replaced reads as untouched and his rating quietly slows down
+**for doing the workout correctly**. Whatever design gets picked, a substitution must
+inherit the replaced exercise's coverage, not sit alongside it. This is the thing most
+likely to silently break, and it directly contradicts a rule he explicitly asked for.
+
+Worth deciding first: is this "edit my program" (persistent, changes the split) or
+"substitute for today" (one session only)? They imply different storage and very different
+rating behaviour, and he's described both at different times.
+
+---
+
+## 13. Maintaining this doc
 
 **Update this file in the same commit as the change.** Specifically:
 
@@ -350,3 +467,6 @@ and reopen.
 | 2026-08-12 | Repo was flat and unbuildable — no `src/main.jsx`, no `tests/`, and a stale `app.js` predating the Lower A rework. Restored the documented layout, wrote the missing entry point, and rebuilt. |
 | 2026-08-12 | Wrote the two missing suites (`smoke.mjs`, `test-flow.mjs`) that `npm test` already referenced, and extracted the jsdom setup into `tests/dom.mjs` so all three share one harness. Added a `ResizeObserver` stub — without it recharts throws in jsdom and the Progress tab can't be tested at all. |
 | 2026-08-12 | Surfaced the §6 dumbbell-benchmark caveat in `RatingCard`. The doc claimed it was shown to the user; it only existed as a source comment. Now rendered, and asserted by `test-flow.mjs`. |
+| 2026-08-12 | **Rest timer bar → screen-edge ring** (§9a). The bar was pushed up by the keyboard and covered the inputs being typed into. Nothing is pinned to the bottom of the screen any more, and the `pb-24`/`pb-44` switch is gone with it. |
+| 2026-08-12 | **Phone keypad fixes** (§9b): weight fields are `type="text"` + `inputMode="decimal"` so the decimal point actually works (7.5 kg was unenterable), and a custom `KeyboardAccessory` bar gives Next / Record-the-set, because iOS's numeric keypad has no return key to hang `enterkeyhint` on. |
+| 2026-08-12 | Brand accent orange → **maroon `#410038`**, defined as a `maroon-*` scale in `tailwind.config` (§9). Base font size 16 → 18px as a single global dial. App renamed to **Chetamba**, which also settles the old two-names open item. |

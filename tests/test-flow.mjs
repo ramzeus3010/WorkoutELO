@@ -95,6 +95,51 @@ check("drop-set lift is told to repeat the weight", coachText.includes("repeat t
 check("mid-range lift is told to add reps", coachText.includes("Stay at 10kg"));
 check("long layoff is called out in the overall note", coachText.includes("start lighter"));
 
+// ---- Keyboard accessory: weight → Next → reps → Record the set ----
+// On iOS the numeric keypad has no return key, so this bar is the only way to move between
+// fields without reaching for the screen. If it stops rendering, logging a set goes back to
+// three separate taps mid-workout.
+console.log("keyboard");
+const kgInput = doc.querySelector('input[placeholder="kg"]');
+const repsInput = doc.querySelector('input[placeholder="reps"]');
+
+check("weight field requests a decimal keypad", kgInput.getAttribute("inputmode") === "decimal");
+check("weight field is not type=number", kgInput.getAttribute("type") !== "number",
+  "type=number renders a dead decimal point on iOS — 7.5kg becomes unenterable");
+check("reps field requests a numeric keypad", repsInput.getAttribute("inputmode") === "numeric");
+
+kgInput.focus();
+await sleep(150);
+check("accessory bar appears when the weight field is focused", !!buttonWithText(doc, "Next"));
+
+setNativeValue(w, kgInput, "7.5");
+await sleep(100);
+click(w, buttonWithText(doc, "Next"));
+await sleep(200);
+check("Next moves focus to the reps field", doc.activeElement === repsInput,
+  `focus landed on ${doc.activeElement && doc.activeElement.placeholder}`);
+check("action button becomes Record the set on the reps field", !!buttonWithText(doc, "Record the set"));
+
+setNativeValue(w, repsInput, "11");
+await sleep(100);
+click(w, buttonWithText(doc, "Record the set"));
+await sleep(300);
+
+const afterRecord = rootText(w);
+check("the set is logged from the keyboard bar", afterRecord.includes("7.5") && afterRecord.includes("Set 1"));
+check("keyboard bar closes after recording", !buttonWithText(doc, "Record the set"));
+
+await sleep(900); // past the 700ms autosave debounce
+check("decimal weight survives into storage", (w.localStorage.getItem("draft_v1") || "").includes('"weight":7.5'));
+
+// ---- Rest timer is a screen-edge ring, never a bar over the inputs ----
+check("recording a set starts the rest ring", !!doc.querySelector("svg.fixed.inset-0"));
+check(
+  "the ring cannot sit on top of a control",
+  (doc.querySelector("svg.fixed.inset-0").getAttribute("class") || "").includes("pointer-events-none")
+);
+check("exact time is available in a readout at the top of the page", /Resting ·/.test(rootText(w)));
+
 // ---- Rating ----
 console.log("rating");
 click(w, buttonWithText(doc, "Progress"));
