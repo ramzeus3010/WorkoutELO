@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Plus, X, Save, ChevronDown, ChevronUp, Trash2, TrendingUp, Dumbbell, History, LineChart as LineChartIcon, Loader2, Play, Pause, RotateCcw, SkipForward, ExternalLink, NotebookPen, Sparkles, ArrowDown, User, Award, Users, Share2, Check } from "lucide-react";
+import { Plus, X, Save, ChevronDown, ChevronUp, Trash2, TrendingUp, Dumbbell, History, LineChart as LineChartIcon, Loader2, Play, Pause, RotateCcw, SkipForward, ExternalLink, NotebookPen, Sparkles, ArrowDown, User, Award, Users, Share2, Check, Copy, FileText } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
 // ---------- Program reference (from the 4-day upper/lower split) ----------
@@ -342,7 +342,7 @@ export default function App() {
             {tab === "log" && <LogView onSave={addSession} timer={timer} sessions={sessions} />}
             {tab === "history" && <HistoryView sessions={sessions} onDelete={deleteSession} />}
             {tab === "progress" && <ProgressView sessions={sessions} profile={profile} />}
-            {tab === "profile" && <ProfileView profile={profile} onSave={saveProfile} />}
+            {tab === "profile" && <ProfileView profile={profile} onSave={saveProfile} sessions={sessions} />}
           </>
         )}
       </div>
@@ -1489,7 +1489,7 @@ function HistoryView({ sessions, onDelete }) {
 
 // ---------- Progress View ----------
 // ---------- Profile View ----------
-function ProfileView({ profile, onSave }) {
+function ProfileView({ profile, onSave, sessions }) {
   const [heightCm, setHeightCm] = useState(profile.heightCm ?? "");
   const [weightKg, setWeightKg] = useState(profile.weightKg ?? "");
   const [displayName, setDisplayName] = useState(profile.displayName ?? "");
@@ -1572,11 +1572,242 @@ function ProfileView({ profile, onSave }) {
         </button>
       </div>
 
+      <ExportPanel sessions={sessions} profile={profile} />
+
       <div className="mt-5 rounded-xl bg-maroon-50 border border-maroon-100 px-4 py-3">
-        <p className="text-xs text-maroon-800 leading-snug">
-          Height and weight stay private, used only for your own rating math and coach suggestions. Your display name and current rating (not your actual workout logs, sets, or notes) are shared publicly on the leaderboard with anyone who has this artifact's link — leave the name blank to opt out.
+        <p className="text-sm text-maroon-800 leading-snug">
+          Everything here stays on your own Telegram account — nothing is uploaded and there is no
+          server. Your display name and rating only leave this device if you tap "Share my score" on
+          the Progress tab, which puts a single line into a chat you choose. Your sets, notes and
+          bodyweight are never in that line.
         </p>
       </div>
+    </div>
+  );
+}
+
+// ---------- Export ----------
+// Two different jobs, deliberately two different formats:
+//   markdown — written to be READ by whoever reviews the training (currently an LLM chat).
+//              It carries the context a reviewer needs to not give bad advice: bodyweight,
+//              day balance, anything the notes flagged as painful, and the caveats from §6.
+//   json     — the actual backup. CloudStorage is the only copy of this data (§5) and
+//              Telegram can lose it, so this must round-trip losslessly. Don't "tidy" it
+//              into the markdown; a backup that a human edited is not a backup.
+// Delivery is clipboard-first: inside Telegram's webview there is no usable file download,
+// and the whole point is pasting into a chat anyway.
+
+const EXPORT_RANGES = [
+  { id: "4w", label: "Last 4 weeks", days: 28 },
+  { id: "12w", label: "Last 3 months", days: 84 },
+  { id: "all", label: "Everything", days: null },
+];
+
+function sessionsInRange(sessions, days) {
+  if (!days) return sessions;
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  const cutoffISO = cutoff.toISOString().slice(0, 10);
+  return sessions.filter((s) => s.date >= cutoffISO);
+}
+
+function describeSet(s) {
+  return `${s.weight}kg×${s.reps}` + (s.drops || []).map((d) => ` → ${d.weight}kg×${d.reps}`).join("");
+}
+
+function buildExportMarkdown(sessions, profile, rangeLabel) {
+  const sorted = [...sessions].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const weight = Number(profile.weightKg) || null;
+  const elo = computeEloTrajectory(sorted, weight);
+  const L = [];
+
+  L.push("# Chetamba training export");
+  L.push("");
+  L.push(`- Exported: ${todayISO()}`);
+  L.push(`- Range: ${rangeLabel} — ${sorted.length} session${sorted.length === 1 ? "" : "s"}`);
+  if (profile.displayName) L.push(`- Athlete: ${profile.displayName}`);
+  const bio = [profile.heightCm ? `${profile.heightCm} cm` : null, weight ? `${weight} kg` : null].filter(Boolean).join(" · ");
+  if (bio) L.push(`- Body: ${bio}`);
+  if (weight && elo.trajectory.length) {
+    L.push(`- Rating: ${elo.rating} (${tierForRating(elo.rating).tier.name}) — see the caveat at the bottom`);
+  }
+
+  if (sorted.length === 0) {
+    L.push("");
+    L.push("_No sessions in this range._");
+    return L.join("\n");
+  }
+
+  // Frequency and day balance. Skipping leg days is the specific historical failure mode
+  // (§1), so make it impossible for a reviewer to miss.
+  const spanDays = Math.max(1, diffDaysBetween(sorted[0].date, sorted[sorted.length - 1].date) + 1);
+  const perWeek = (sorted.length / (spanDays / 7)).toFixed(1);
+  L.push(`- Frequency: ${perWeek} sessions/week across ${spanDays} days`);
+  L.push("");
+  L.push("## Day balance");
+  L.push("");
+  DAYS.forEach((d) => {
+    const n = sorted.filter((s) => s.day === d).length;
+    L.push(`- ${d}: ${n}`);
+  });
+  const other = sorted.filter((s) => !DAYS.includes(s.day)).length;
+  if (other) L.push(`- Other/custom: ${other}`);
+
+  // Anything the notes flagged as painful, pulled from the logs rather than hard-coded, so
+  // this stays correct if someone else uses the app.
+  const flagged = [];
+  sorted.forEach((s) => {
+    s.exercises.forEach((e) => {
+      if (noteSignalsProblem(e.notes)) flagged.push(`- ${s.date} · ${e.name}: "${String(e.notes).trim()}"`);
+    });
+  });
+  if (flagged.length) {
+    L.push("");
+    L.push("## Flagged as painful or uncomfortable");
+    L.push("");
+    L.push("These came from the athlete's own notes. Treat them as constraints, not as things to push through.");
+    L.push("");
+    flagged.forEach((f) => L.push(f));
+  }
+
+  L.push("");
+  L.push("## Sessions (newest first)");
+  sorted.forEach((s) => {
+    L.push("");
+    L.push(`### ${s.date} · ${s.day}${s.duration ? ` · ${s.duration} min` : ""}`);
+    L.push("");
+    s.exercises.forEach((e) => {
+      const meta = metaFor(e.name);
+      const sets = e.sets.map(describeSet).join(", ");
+      const unit = meta.type === "duration" ? " (reps column is seconds)" : "";
+      L.push(`- **${e.name}**: ${sets || "no sets logged"}${unit}`);
+      if (e.notes) L.push(`  - note: "${String(e.notes).trim()}"`);
+    });
+  });
+
+  L.push("");
+  L.push("## How to read this");
+  L.push("");
+  L.push("- Weights are per dumbbell/machine as entered, in kg. `20kg×12` is 20 kg for 12 reps.");
+  L.push("- `→` marks a drop set: the athlete went to failure and immediately continued lighter.");
+  L.push("- Duration work (planks, rowing) is logged as **seconds in the reps field** — a known rough edge.");
+  L.push("- The rating is a bodyweight-relative score run through Elo-style maths. There is no");
+  L.push("  published strength-standard database for dumbbell lifts, so its benchmarks are");
+  L.push("  directional estimates derived from barbell standards.");
+  L.push("- It is a game score, not a clinical measure — don't reason about health from it.");
+  L.push("- Sessions are only what was logged. An absent exercise may have been skipped or just not recorded.");
+
+  return L.join("\n");
+}
+
+function buildExportJSON(sessions, profile) {
+  return JSON.stringify(
+    {
+      app: "chetamba",
+      formatVersion: 1,
+      exportedAt: new Date().toISOString(),
+      profile,
+      sessions: [...sessions].sort((a, b) => (a.date < b.date ? 1 : -1)),
+    },
+    null,
+    2
+  );
+}
+
+function ExportPanel({ sessions, profile }) {
+  const [rangeId, setRangeId] = useState("4w");
+  const [copied, setCopied] = useState("");
+  const [fallback, setFallback] = useState("");
+  const fallbackRef = useRef(null);
+
+  const range = EXPORT_RANGES.find((r) => r.id === rangeId) || EXPORT_RANGES[0];
+  const scoped = useMemo(() => sessionsInRange(sessions, range.days), [sessions, range.days]);
+
+  async function copy(text, which) {
+    setFallback("");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(which);
+      setTimeout(() => setCopied(""), 2000);
+      return;
+    } catch (e) {
+      // Some webviews block the clipboard API outright. Show the text so it can be
+      // selected by hand rather than failing silently.
+      setFallback(text);
+      setTimeout(() => {
+        if (fallbackRef.current) {
+          fallbackRef.current.focus();
+          try { fallbackRef.current.select(); } catch (err) { /* not selectable */ }
+        }
+      }, 50);
+    }
+  }
+
+  return (
+    <div className="mt-5 rounded-xl bg-gray-50 border border-gray-200 px-4 py-3.5">
+      <div className="flex items-center gap-1.5 mb-2.5">
+        <FileText size={14} className="text-maroon-600" />
+        <p className="text-sm uppercase tracking-wider text-gray-500 font-semibold">Export</p>
+      </div>
+      <p className="text-sm text-gray-500 mb-3 leading-snug">
+        Copy your training out to review it somewhere else, or to keep a backup. Telegram's
+        storage is the only copy of this data.
+      </p>
+
+      <div className="flex gap-1.5 mb-3">
+        {EXPORT_RANGES.map((r) => (
+          <button
+            key={r.id}
+            onClick={() => { setRangeId(r.id); setFallback(""); }}
+            className={`flex-1 text-sm font-semibold rounded-md py-2 ${
+              rangeId === r.id ? "bg-maroon-600 text-white" : "bg-white text-gray-500 border border-gray-200"
+            }`}
+          >
+            {r.label}
+          </button>
+        ))}
+      </div>
+
+      <p className="text-sm text-gray-400 mb-2">
+        {scoped.length} session{scoped.length === 1 ? "" : "s"} in range
+      </p>
+
+      <button
+        onClick={() => copy(buildExportMarkdown(scoped, profile, range.label), "md")}
+        disabled={scoped.length === 0}
+        className={`w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold mb-1.5 ${
+          scoped.length === 0 ? "bg-gray-200 text-gray-400" : "bg-maroon-600 text-white"
+        }`}
+      >
+        {copied === "md" ? <><Check size={15} /> Copied — paste it into the chat</> : <><Copy size={15} /> Copy for review</>}
+      </button>
+      <button
+        onClick={() => copy(buildExportJSON(scoped, profile), "json")}
+        disabled={scoped.length === 0}
+        className="w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold bg-white text-gray-700 border border-gray-200"
+      >
+        {copied === "json" ? <><Check size={15} /> Backup copied</> : <><Save size={15} /> Copy backup (JSON)</>}
+      </button>
+
+      {fallback && (
+        <div className="mt-2.5">
+          <p className="text-sm text-maroon-700 mb-1.5">
+            Couldn't reach the clipboard here — select all of this and copy it manually.
+          </p>
+          <textarea
+            ref={fallbackRef}
+            readOnly
+            value={fallback}
+            rows={6}
+            className="w-full resize-none bg-white rounded-md px-2.5 py-2 text-xs font-mono text-gray-900 border border-gray-200"
+          />
+        </div>
+      )}
+
+      <p className="text-sm text-gray-400 mt-2.5 leading-snug">
+        "Copy for review" is readable text meant for a person or a chat. "Copy backup" is the
+        raw data — keep that one somewhere safe.
+      </p>
     </div>
   );
 }

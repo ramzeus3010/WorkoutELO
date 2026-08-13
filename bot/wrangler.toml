@@ -1,0 +1,12 @@
+name = "chetamba-bot"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Non-secret config. Secrets (BOT_TOKEN, WEBHOOK_SECRET) are NOT here on purpose —
+# this file is committed. Set those with `wrangler secret put`. See README.md.
+[vars]
+MINI_APP_URL = "https://ramzeus3010.github.io/WorkoutELO/dist/"
+DIRECT_LINK = "https://t.me/workoutelobot/chetamba"
+
+# Optional: an https image URL to show as a card above the /start message.
+# PREVIEW_IMAGE_URL = "https://ramzeus3010.github.io/WorkoutELO/dist/preview.png"

@@ -6,8 +6,9 @@ Handover doc for **Chetamba** — a workout tracker running as a Telegram Mini A
 > changing anything. **Update it in the same commit as any change** — see
 > [Maintaining this doc](#maintaining-this-doc) at the bottom.
 
-Last updated: 2026-08-12 · Status: builds clean, all three suites green, **not yet deployed**
-· Next up: [editable exercises](#12-next-session--editable--custom-exercises)
+Last updated: 2026-08-13 · Status: app builds clean, all five suites green, **Pages deploy
+and bot webhook not yet verified live** · Next up:
+[editable exercises](#12-next-session--editable--custom-exercises)
 
 ---
 
@@ -44,6 +45,15 @@ A single-page React app bundled to one JS file, loaded by Telegram in a webview.
 - Hosted as static files (GitHub Pages). Telegram does not host anything itself — it
   only opens a URL, and that URL must be HTTPS with a valid certificate.
 
+### The one exception: `bot/`
+
+The **bot webhook** (§10a) is a small Cloudflare Worker, and it is the only server-side
+code in the project. It exists solely so `/start` replies with a button; **it never sees
+workout data**, which never leaves the user's own Telegram account. The app does not call
+it and does not know it exists — delete the worker and the Mini App still works exactly as
+before, you just get a silent bot again. Keep that separation: the moment the app starts
+talking to the worker, every privacy claim in the Profile tab has to be rewritten.
+
 ### Why not the earlier versions
 
 This started as a Claude artifact using `window.storage`. That required both users to
@@ -65,11 +75,17 @@ rejected as unnecessary once Telegram CloudStorage covered the storage need.
 ├── dist/
 │   ├── index.html       ← page shell; loads Telegram SDK + Tailwind CDN + app.js
 │   └── app.js           ← build output, COMMITTED (GitHub Pages serves it directly)
+├── bot/                 ← Telegram bot webhook (Cloudflare Worker). Deployed separately.
+│   ├── worker.js        ← answers /start, /app, /help with an Open-the-Mini-App button
+│   ├── wrangler.toml    ← non-secret config; secrets are set with `wrangler secret put`
+│   └── README.md        ← setup + BotFather steps
 └── tests/
     ├── dom.mjs          ← shared jsdom harness + assertion helpers (no test cases)
     ├── smoke.mjs        ← renders the bundle in jsdom, visits every tab, asserts no errors
     ├── test-autosave.mjs← logs a set, kills app, reopens, asserts restore
-    └── test-flow.mjs    ← coach + rating + leaderboard end-to-end
+    ├── test-flow.mjs    ← coach + keyboard + rating + leaderboard end-to-end
+    ├── test-export.mjs  ← markdown + JSON export content and round-tripping (§8a)
+    └── test-bot.mjs     ← bot webhook, with the Telegram API stubbed (no network)
 ```
 
 `dist/app.js` **is committed on purpose** — GitHub Pages serves static files with no
@@ -87,8 +103,11 @@ new test should import from there rather than rebuilding its own DOM.
 ```bash
 npm install
 npm run build     # src/ -> dist/app.js
-npm test          # build + all three suites
+npm test          # build + all five suites
 ```
+
+The bot is deployed separately and is not part of `npm run build` — see `bot/README.md`.
+`npm test` does cover it (`tests/test-bot.mjs`, Telegram API stubbed, no network).
 
 There is no dev server. To iterate: `npm run build`, then open `dist/index.html` in a
 browser. Outside Telegram the app falls back to `localStorage`, so it's fully testable
@@ -257,6 +276,51 @@ scope change, not a bug fix.
 
 ---
 
+## 8a. Export
+
+Lives in the **Profile** tab. Two buttons, two formats, deliberately not one:
+
+| Button | Format | Job |
+|---|---|---|
+| Copy for review | Markdown | To be **read** — pasted into a chat with an LLM for a training review |
+| Copy backup (JSON) | JSON | To be **restored** — must round-trip losslessly |
+
+Don't merge them. A backup a human has reformatted is not a backup, and a raw JSON dump is
+a poor thing to hand a reviewer.
+
+Range selector: last 4 weeks / last 3 months / everything. He reviews roughly monthly, and
+an unbounded dump gets unwieldy fast.
+
+### What the markdown carries, and why
+
+The export is the only context a reviewer gets, so it ships the things that stop them
+giving bad advice:
+
+- **Bodyweight**, because every rating number is relative to it.
+- **Day balance** — sessions per program day. Skipping leg days is the specific historical
+  failure mode (§1); a reviewer should not have to count dates to notice it.
+- **Anything the notes flagged as painful**, pulled out of the logs via
+  `noteSignalsProblem` and labelled as constraints rather than as things to push through.
+  This is derived from the data, **not hard-coded to his injuries** — friends using the app
+  get their own flags, and nobody gets his.
+- **The §6 caveat**, verbatim: benchmarks are estimates, it's a game score, don't reason
+  about health from it. It travels with the data instead of only living in the UI, because
+  the number is about to be shown to something that will happily over-interpret it.
+- The `seconds-in-the-reps-field` quirk for duration work, which otherwise reads as someone
+  doing 300-rep planks.
+
+`tests/test-export.mjs` asserts all of the above, plus that the JSON round-trips drop sets,
+decimals and notes exactly.
+
+### Delivery
+
+Clipboard, not file download: inside Telegram's webview there is no usable download, and
+the destination is a chat anyway. Some webviews block the clipboard API outright, so a
+failed copy falls back to showing the text in a focused, selected textarea rather than
+failing silently.
+
+---
+
 ## 9. Styling and phone-input constraints
 
 `dist/index.html` loads the **Tailwind Play CDN**, which compiles at runtime.
@@ -376,6 +440,41 @@ next open — no reinstall, no store review. Telegram caches the webview aggress
 change doesn't appear, fully close the mini app (swipe it away, don't just background it)
 and reopen.
 
+### 10a. The bot itself
+
+Current bot: **@workoutelobot**, app short name `chetamba`, direct link
+`https://t.me/workoutelobot/chetamba`.
+
+⚠️ **BotFather does not make a bot answer messages.** It registers the bot and the Mini App,
+nothing more. `/start` reaches whatever URL is registered as the bot's webhook, and if
+nothing is listening the bot looks dead — even while the direct link works perfectly,
+because a direct-link Mini App is opened by Telegram itself with no bot logic involved.
+That was the "my bot doesn't do anything" symptom on 2026-08-13.
+
+`bot/worker.js` is the listener. Cloudflare Worker, free tier, stateless. Setup steps are
+in `bot/README.md`; the short version:
+
+1. `wrangler secret put BOT_TOKEN` / `WEBHOOK_SECRET`, then `wrangler deploy`.
+2. Register the webhook: `api.telegram.org/bot<TOKEN>/setWebhook?url=<worker>&secret_token=<secret>`.
+3. When the bot goes quiet, `getWebhookInfo` and read `last_error_message` — that's where
+   the answer is, every time.
+
+Design rules for the worker, don't break them:
+
+- It **always returns 200**, even on an error. Telegram redelivers any update that isn't
+  2xx, so a thrown exception turns one bad message into a retry storm.
+- It checks the `x-telegram-bot-api-secret-token` header. Without that the endpoint is a
+  public URL that anyone can post fabricated updates to.
+- `web_app` buttons only work in **private chats**. In groups it falls back to the plain
+  direct link, otherwise Telegram rejects the message and the user sees nothing at all.
+- `BOT_TOKEN` is full control of the bot. It is a Worker secret and must never be committed
+  or shipped to the client.
+
+**The shared-link preview is a separate thing.** The card people see when the
+`t.me/workoutelobot/chetamba` link is pasted into a chat comes from the Mini App's own
+photo/title/description in BotFather (`/myapps`), not from the worker. Both halves have to
+be set to look finished — see the table in `bot/README.md`.
+
 ---
 
 ## 11. Open items
@@ -395,7 +494,9 @@ and reopen.
 - [ ] Lateral raise mid-back pain — monitor; medical attention if it persists.
 - [ ] Row form: he reported not feeling his back. Cue is elbow back/down, pause and
       squeeze the shoulder blade, don't shrug or pull with the arm.
-- [ ] No export/backup. If Telegram data is lost, it's gone.
+- [ ] **Export is copy-only, and restore doesn't exist.** You can get a JSON backup out
+      (§8a) but there is no import to put it back. Until that's built, the backup protects
+      against Telegram losing the data, not against a bad write inside the app.
 
 ---
 
@@ -439,9 +540,42 @@ slows the climb.** If a swapped-in exercise is treated as *new* rather than as a
 inherit the replaced exercise's coverage, not sit alongside it. This is the thing most
 likely to silently break, and it directly contradicts a rule he explicitly asked for.
 
-Worth deciding first: is this "edit my program" (persistent, changes the split) or
-"substitute for today" (one session only)? They imply different storage and very different
-rating behaviour, and he's described both at different times.
+**Decided 2026-08-13: both.** He substitutes for himself when a machine is taken
+(one session, doesn't change the split), *and* he wants friends to build their own programs
+from scratch (persistent). So this needs two distinct actions in the UI, not one blurred
+"edit" — a today-only swap and a permanent program change behave differently in the rating
+and should not be reachable from the same button.
+
+Implied by "friends build their own": the built-in 4-day split stops being *the* program
+and becomes the default for a new user. Everything in §7's coach and §6's rating that reads
+`PROGRAM` has to read the user's program instead.
+
+### 12a. AI-generated programs — the blocker to solve first
+
+Raised 2026-08-13: friends describe what they want, an LLM generates a program. Fine idea.
+Two things have to be true before any of it gets written:
+
+**1. The API key cannot live in the client.** This is the same wall §7 already hit: an
+earlier version called the Anthropic API from the browser and was torn out because the key
+had to ship inside client-side code. Nothing has changed — `dist/app.js` is a public file
+on GitHub Pages, so a key in it is a key published to the internet. Whoever's key it is
+gets drained. Cost isn't the issue (a program generation is a fraction of a cent, so a $10
+balance is plenty of runway); **exposure** is.
+
+The fix is a server-side proxy, and `bot/` is already the right place — a Cloudflare Worker
+with the key as a secret. The client sends the user's request, the worker calls the model
+and returns the result. The key never reaches the phone.
+
+**2. A public proxy is a free LLM for the entire internet.** Anyone who reads the bundle
+finds the worker URL and can hammer it. Mitigation is Telegram's own signature: the Mini App
+receives `initData` signed with the bot token, so the worker can verify with HMAC that a
+caller is a real user of this bot, and rate-limit per user id. **Do not ship the proxy
+without this.** It's the difference between a $0.30/month bill and a drained account.
+
+Also worth settling before building: a generated program still needs `multiplier` and `avg`
+values per exercise for the rating to work at all (see point 3 above), so generation and the
+custom-exercise metadata problem are the same problem — solve that first, and generation
+becomes "fill in the same fields a human would have".
 
 ---
 
@@ -470,3 +604,6 @@ rating behaviour, and he's described both at different times.
 | 2026-08-12 | **Rest timer bar → screen-edge ring** (§9a). The bar was pushed up by the keyboard and covered the inputs being typed into. Nothing is pinned to the bottom of the screen any more, and the `pb-24`/`pb-44` switch is gone with it. |
 | 2026-08-12 | **Phone keypad fixes** (§9b): weight fields are `type="text"` + `inputMode="decimal"` so the decimal point actually works (7.5 kg was unenterable), and a custom `KeyboardAccessory` bar gives Next / Record-the-set, because iOS's numeric keypad has no return key to hang `enterkeyhint` on. |
 | 2026-08-12 | Brand accent orange → **maroon `#410038`**, defined as a `maroon-*` scale in `tailwind.config` (§9). Base font size 16 → 18px as a single global dial. App renamed to **Chetamba**, which also settles the old two-names open item. |
+| 2026-08-13 | **Export** added to the Profile tab (§8a): readable markdown for review, lossless JSON for backup, with a range selector. Closes the long-standing "no export/backup" item; restore is still missing. |
+| 2026-08-13 | **Bot answers `/start`** (§10a). `bot/` is a Cloudflare Worker webhook — the first and only server-side code in the project, and it never sees workout data. The bot looked broken because BotFather registers a bot but doesn't reply for it, and nothing was listening. |
+| 2026-08-13 | Corrected the Profile privacy notice, which still claimed the leaderboard published your name and rating to "anyone with this artifact's link". That stopped being true when the leaderboard became share/paste (§8). |
