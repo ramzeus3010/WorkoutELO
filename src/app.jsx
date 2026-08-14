@@ -3,7 +3,11 @@ import { createPortal } from "react-dom";
 import { Plus, X, Save, ChevronDown, ChevronUp, Trash2, TrendingUp, Dumbbell, History, LineChart as LineChartIcon, Loader2, Play, Pause, RotateCcw, SkipForward, ExternalLink, NotebookPen, Sparkles, ArrowDown, User, Award, Users, Share2, Check, Copy, FileText } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
-// ---------- Program reference (from the 4-day upper/lower split) ----------
+// ---------- The built-in 4-day upper/lower split ----------
+// This is the DEFAULT a new user starts from, not the program itself — since §13 the live
+// program is editable and lives in CloudStorage. Editing this constant changes what new
+// users get and what "restore the built-in split" restores; it does not touch anyone who
+// has already edited theirs.
 // rest = default rest timer length in seconds for that exercise
 const PROGRAM = {
   "Upper A": {
@@ -50,7 +54,6 @@ const PROGRAM = {
   },
 };
 
-const DAYS = Object.keys(PROGRAM);
 const PROFILE_KEY = "profile";
 const DEFAULT_REST = 60;
 
@@ -102,6 +105,150 @@ const TIERS = [
   { name: "Top 5%", min: 2000, color: "text-purple-600", bg: "bg-purple-100" },
 ];
 
+// ---------- Exercise identity ----------
+// Exercises are identified by a stable id, never by their display name. Names are editable,
+// and matching on them meant renaming a lift silently detached its entire history from the
+// coach, the charts and the rating. Built-in exercises derive their id from their original
+// name, so sessions logged before ids existed migrate for free (see normalizeSession).
+function slugId(name) {
+  return (
+    String(name || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "x"
+  );
+}
+
+const BUILTIN_META_BY_ID = {};
+Object.keys(EXERCISE_META).forEach((n) => { BUILTIN_META_BY_ID[slugId(n)] = EXERCISE_META[n]; });
+
+// ---------- Movement patterns ----------
+// A user-added exercise has no benchmark, and the rating can't score what it can't measure.
+// Rather than inventing a number per exercise, the user picks the movement pattern and
+// inherits its multiplier/type/avg. Same honesty caveat as §6 applies, harder: these are
+// rough family averages, not measurements of any specific lift.
+const MOVEMENT_PATTERNS = [
+  { id: "push-horizontal", label: "Horizontal push", hint: "bench, chest press, dips", multiplier: 1.5, type: "weight", avg: 0.18 },
+  { id: "push-vertical", label: "Overhead push", hint: "shoulder press, OHP", multiplier: 1.5, type: "weight", avg: 0.12 },
+  { id: "pull-horizontal", label: "Row", hint: "any rowing movement", multiplier: 1.5, type: "weight", avg: 0.21 },
+  { id: "pull-vertical", label: "Pulldown / pull-up", hint: "lats", multiplier: 1.5, type: "weight", avg: 0.46 },
+  { id: "squat", label: "Squat / leg press", hint: "loaded knee bend", multiplier: 1.5, type: "weight", avg: 0.60 },
+  { id: "hinge", label: "Hinge", hint: "glutes and hamstrings", multiplier: 1.4, type: "weight", avg: 0.30 },
+  { id: "lunge", label: "Lunge / split squat", hint: "one leg at a time", multiplier: 1.3, type: "weight", avg: 0.15 },
+  { id: "isolation-upper", label: "Arm / shoulder isolation", hint: "curls, raises, extensions", multiplier: 0.75, type: "weight", avg: 0.10 },
+  { id: "isolation-lower", label: "Leg isolation", hint: "extensions, curls", multiplier: 0.8, type: "weight", avg: 0.40 },
+  { id: "calves", label: "Calves", hint: "counted in reps", multiplier: 0.55, type: "reps", avg: 20 },
+  { id: "bodyweight-reps", label: "Bodyweight reps", hint: "push-ups, back extensions", multiplier: 0.75, type: "reps", avg: 15 },
+  { id: "core", label: "Core hold", hint: "planks — logged in seconds", multiplier: 0.5, type: "duration", avg: 45 },
+  { id: "conditioning", label: "Conditioning", hint: "rowing, bike — logged in seconds", multiplier: 0.6, type: "duration", avg: 480 },
+];
+
+function patternById(id) {
+  return MOVEMENT_PATTERNS.find((p) => p.id === id) || null;
+}
+
+// Best-guess pattern for a built-in exercise, so opening one in the editor shows something
+// sensible rather than an empty selector. Closest multiplier within the same measurement type.
+function inferPatternId(meta) {
+  if (!meta) return "isolation-upper";
+  const sameType = MOVEMENT_PATTERNS.filter((p) => p.type === meta.type);
+  const pool = sameType.length ? sameType : MOVEMENT_PATTERNS;
+  let best = pool[0];
+  let bestScore = Infinity;
+  pool.forEach((p) => {
+    const score = Math.abs(p.multiplier - meta.multiplier) + Math.abs(p.avg - meta.avg) / Math.max(p.avg, meta.avg, 0.01);
+    if (score < bestScore) { bestScore = score; best = p; }
+  });
+  return best.id;
+}
+
+function metaFromPattern(patternId) {
+  const p = patternById(patternId);
+  if (!p) return { ...DEFAULT_EXERCISE_META };
+  return { multiplier: p.multiplier, type: p.type, avg: p.avg };
+}
+
+// ---------- The program ----------
+// PROGRAM above is no longer *the* program — it's the default a new user starts from. The
+// live program lives in CloudStorage and is fully editable (§13).
+const DEFAULT_PROGRAM = (() => {
+  const days = Object.keys(PROGRAM).map((name) => ({ id: slugId(name), name, subtitle: PROGRAM[name].subtitle }));
+  const exercisesByDay = {};
+  Object.keys(PROGRAM).forEach((dayName) => {
+    exercisesByDay[slugId(dayName)] = PROGRAM[dayName].exercises.map((e) => {
+      const meta = EXERCISE_META[e.name] || DEFAULT_EXERCISE_META;
+      return {
+        id: slugId(e.name),
+        name: e.name,
+        muscle: e.muscle,
+        target: e.target,
+        rest: e.rest,
+        link: e.link,
+        pattern: inferPatternId(meta),
+        meta,
+        builtIn: true,
+      };
+    });
+  });
+  return { version: 1, days, exercisesByDay };
+})();
+
+// Attaches an id -> meta index. Everything that needs an exercise's rating metadata goes
+// through this, so there is exactly one place that knows the lookup order.
+function withMetaIndex(program) {
+  const metaById = {};
+  (program.days || []).forEach((d) => {
+    (program.exercisesByDay[d.id] || []).forEach((e) => {
+      metaById[e.id] = e.meta || DEFAULT_EXERCISE_META;
+    });
+  });
+  return { ...program, metaById };
+}
+
+// Lookup order: the user's own program wins, then the built-in table (for exercises that
+// were removed from the program but still appear in history), then a neutral default.
+// Lookup order matters:
+//   1. the live program — so editing an exercise's pattern re-contextualises its whole
+//      history, the same way changing bodyweight does (§6).
+//   2. metadata carried on the logged entry itself — the only source for a one-day
+//      substitute, which by definition isn't in the program.
+//   3. the built-in table, for exercises removed from the program but still in history.
+function metaForEntry(entry, program) {
+  if (!entry) return DEFAULT_EXERCISE_META;
+  const byId = (program && program.metaById) || {};
+  return (
+    byId[entry.id] ||
+    entry.meta ||
+    BUILTIN_META_BY_ID[entry.id] ||
+    EXERCISE_META[entry.name] ||
+    DEFAULT_EXERCISE_META
+  );
+}
+
+function dayById(program, dayId) {
+  return (program.days || []).find((d) => d.id === dayId) || null;
+}
+
+function exercisesForDay(program, dayId) {
+  return program.exercisesByDay[dayId] || [];
+}
+
+// Every exercise in the program, deduped — an exercise appearing on two days is one slot,
+// not two.
+function programSlots(program) {
+  const seen = new Set();
+  const slots = [];
+  (program.days || []).forEach((d) => {
+    (program.exercisesByDay[d.id] || []).forEach((e) => {
+      if (seen.has(e.id)) return;
+      seen.add(e.id);
+      slots.push({ id: e.id, name: e.name, meta: e.meta || DEFAULT_EXERCISE_META });
+    });
+  });
+  return slots;
+}
+
 // ---------- Telegram platform bridge ----------
 // Telegram CloudStorage caps each value at 4096 chars, so sessions are stored one key per
 // session (sess_<id>) rather than as a single blob, with an index key listing the ids.
@@ -142,6 +289,18 @@ const cloud = {
 const SESSION_PREFIX = "sess_";
 const INDEX_KEY = "sess_index";
 
+// Sessions written before exercises had ids only stored display names. Rather than rewriting
+// storage (a migration that can half-fail), ids are derived on read — slugId() of a built-in
+// name reproduces exactly the id that exercise has in the default program, so old history
+// reattaches itself to the right slot. Same trick for the day.
+function normalizeSession(s) {
+  return {
+    ...s,
+    dayId: s.dayId || slugId(s.day),
+    exercises: (s.exercises || []).map((e) => ({ ...e, id: e.id || slugId(e.name) })),
+  };
+}
+
 async function loadAllSessions() {
   const raw = await cloud.get(INDEX_KEY);
   let ids = [];
@@ -150,9 +309,69 @@ async function loadAllSessions() {
   for (const id of ids) {
     const s = await cloud.get(SESSION_PREFIX + id);
     if (!s) continue;
-    try { out.push(JSON.parse(s)); } catch (e) { /* skip corrupt entry */ }
+    try { out.push(normalizeSession(JSON.parse(s))); } catch (e) { /* skip corrupt entry */ }
   }
   return out;
+}
+
+// ---------- Program storage ----------
+// Split the same way sessions are (§5): one key per day, because a single blob of four days
+// with links and targets would sit right on the 4096-char ceiling.
+const PROGRAM_KEY = "prog_v1";
+const PROGRAM_DAY_PREFIX = "prog_d_";
+
+async function loadProgram() {
+  const raw = await cloud.get(PROGRAM_KEY);
+  if (!raw) return withMetaIndex(DEFAULT_PROGRAM); // never edited — use the built-in split
+  let head;
+  try { head = JSON.parse(raw); } catch (e) { return withMetaIndex(DEFAULT_PROGRAM); }
+  if (!head || !Array.isArray(head.days) || head.days.length === 0) return withMetaIndex(DEFAULT_PROGRAM);
+
+  const exercisesByDay = {};
+  for (const d of head.days) {
+    const r = await cloud.get(PROGRAM_DAY_PREFIX + d.id);
+    try { exercisesByDay[d.id] = r ? JSON.parse(r) : []; } catch (e) { exercisesByDay[d.id] = []; }
+  }
+  return withMetaIndex({ version: 1, days: head.days, exercisesByDay });
+}
+
+async function saveProgram(program) {
+  // Check every day fits before writing any of it, so a too-big day can't leave the program
+  // half-saved with an index pointing at days that were never written.
+  for (const d of program.days) {
+    const payload = JSON.stringify(program.exercisesByDay[d.id] || []);
+    if (payload.length > 4000) {
+      return { ok: false, reason: `"${d.name}" has too much in it to store. Shorten some names or notes, or split it across two days.` };
+    }
+  }
+
+  const prevRaw = await cloud.get(PROGRAM_KEY);
+  let prevDays = [];
+  try { prevDays = prevRaw ? (JSON.parse(prevRaw).days || []) : []; } catch (e) { prevDays = []; }
+
+  for (const d of program.days) {
+    const ok = await cloud.set(PROGRAM_DAY_PREFIX + d.id, JSON.stringify(program.exercisesByDay[d.id] || []));
+    if (!ok) return { ok: false, reason: "Storage write failed." };
+  }
+  const ok = await cloud.set(PROGRAM_KEY, JSON.stringify({ version: 1, days: program.days }));
+  if (!ok) return { ok: false, reason: "Couldn't save the program index." };
+
+  // Only now that the index no longer references them, drop deleted days' keys. Doing this
+  // first would strand the data if the index write failed.
+  const liveIds = new Set(program.days.map((d) => d.id));
+  for (const d of prevDays) {
+    if (!liveIds.has(d.id)) await cloud.remove(PROGRAM_DAY_PREFIX + d.id);
+  }
+  return { ok: true };
+}
+
+async function resetProgram() {
+  const raw = await cloud.get(PROGRAM_KEY);
+  let days = [];
+  try { days = raw ? (JSON.parse(raw).days || []) : []; } catch (e) { days = []; }
+  for (const d of days) await cloud.remove(PROGRAM_DAY_PREFIX + d.id);
+  await cloud.remove(PROGRAM_KEY);
+  return withMetaIndex(DEFAULT_PROGRAM);
 }
 
 // Sessions are written individually so one oversized session can never corrupt the whole log.
@@ -264,6 +483,7 @@ export default function App() {
   const [tab, setTab] = useState("log");
   const [sessions, setSessions] = useState(null);
   const [profile, setProfile] = useState(null);
+  const [program, setProgram] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const timer = useRestTimer();
@@ -276,6 +496,7 @@ export default function App() {
       } catch (e) { /* older Telegram clients */ }
     }
     (async () => {
+      setProgram(await loadProgram());
       const loaded = await loadAllSessions();
       setSessions(loaded);
       const raw = await cloud.get(PROFILE_KEY);
@@ -314,7 +535,25 @@ export default function App() {
     setSaving(false);
   }
 
-  const loading = sessions === null || profile === null;
+  async function commitProgram(next) {
+    setSaving(true);
+    setError("");
+    const withIndex = withMetaIndex(next);
+    const res = await saveProgram(withIndex);
+    if (res.ok) setProgram(withIndex);
+    else setError(res.reason);
+    setSaving(false);
+    return res;
+  }
+
+  async function restoreDefaultProgram() {
+    setSaving(true);
+    setError("");
+    setProgram(await resetProgram());
+    setSaving(false);
+  }
+
+  const loading = sessions === null || profile === null || program === null;
 
   return (
     <div
@@ -339,10 +578,26 @@ export default function App() {
                 {error}
               </div>
             )}
-            {tab === "log" && <LogView onSave={addSession} timer={timer} sessions={sessions} />}
+            {tab === "log" && <LogView onSave={addSession} timer={timer} sessions={sessions} program={program} />}
             {tab === "history" && <HistoryView sessions={sessions} onDelete={deleteSession} />}
-            {tab === "progress" && <ProgressView sessions={sessions} profile={profile} />}
-            {tab === "profile" && <ProfileView profile={profile} onSave={saveProfile} sessions={sessions} />}
+            {tab === "progress" && <ProgressView sessions={sessions} profile={profile} program={program} />}
+            {tab === "profile" && (
+              <ProfileView
+                profile={profile}
+                onSave={saveProfile}
+                sessions={sessions}
+                program={program}
+                onEditProgram={() => setTab("program")}
+              />
+            )}
+            {tab === "program" && (
+              <ProgramEditor
+                program={program}
+                onCommit={commitProgram}
+                onReset={restoreDefaultProgram}
+                onBack={() => setTab("profile")}
+              />
+            )}
           </>
         )}
       </div>
@@ -383,7 +638,9 @@ function BottomNav({ tab, setTab }) {
             key={id}
             onClick={() => setTab(id)}
             className={`flex flex-col items-center gap-1 py-3 text-xs transition-colors ${
-              tab === id ? "text-maroon-600" : "text-gray-500"
+              // The program editor is a sub-screen of Profile rather than a fifth tab —
+              // five icons at 18px base don't fit, and it isn't a daily destination.
+              tab === id || (id === "profile" && tab === "program") ? "text-maroon-600" : "text-gray-500"
             }`}
           >
             <Icon size={18} />
@@ -576,8 +833,10 @@ function diffDaysBetween(aIso, bIso) {
   return Math.max(0, Math.round((a - b) / 86400000));
 }
 
-function metaFor(name) {
-  return EXERCISE_META[name] || DEFAULT_EXERCISE_META;
+// The slot an entry counts toward. A today-only substitution is credited to the exercise it
+// replaced, NOT to itself — see the comment on computeEloTrajectory for why that matters.
+function slotIdOf(entry) {
+  return entry.substituteFor || entry.id;
 }
 
 // Pull the "top" logged set for an exercise entry (main weight/reps, ignoring drop-set weights,
@@ -589,8 +848,7 @@ function topSetOf(exerciseEntry) {
 
 // Performance index for a single logged instance of an exercise: 1.0 = benchmark "average person"
 // your current bodyweight, 2.0 = benchmark "top 5%".
-function performanceIndex(exerciseEntry, bodyweightKg) {
-  const meta = metaFor(exerciseEntry.name);
+function performanceIndex(exerciseEntry, bodyweightKg, meta) {
   const top = topSetOf(exerciseEntry);
   if (!top || !bodyweightKg) return null;
   if (meta.type === "weight") {
@@ -626,15 +884,25 @@ function tierForRating(rating) {
 // decay toward a neutral 1.0 (not 0) over RATING_HALF_LIFE_DAYS — so missing one lift slows growth,
 // it doesn't freeze or reverse it. Always uses your CURRENT saved bodyweight, so updating your profile
 // re-contextualizes your whole history, not just future sessions.
-function computeEloTrajectory(sessions, bodyweightKg) {
-  if (!bodyweightKg || !sessions || sessions.length === 0) {
+// The denominator is the CURRENT program, not everything ever logged. Two consequences,
+// both deliberate:
+//   - Removing an exercise from your program stops it dragging on your rating forever.
+//   - A substituted lift is credited to the slot it replaced (slotIdOf), so swapping in a
+//     leg extension when the leg press is taken does NOT leave "leg press" reading as
+//     untouched. Without this, doing the workout correctly would slow your climb, which
+//     directly contradicts the rule in §6 that skipping is what costs you.
+// The substitute is scored with ITS OWN benchmark (you did a leg extension, so it's judged
+// as a leg extension) but weighted by the SLOT's multiplier, because that's the role it
+// filled today.
+function computeEloTrajectory(sessions, bodyweightKg, program) {
+  const prog = program && program.days ? program : withMetaIndex(DEFAULT_PROGRAM);
+  const slots = programSlots(prog);
+  if (!bodyweightKg || !sessions || sessions.length === 0 || slots.length === 0) {
     return { trajectory: [], rating: RATING_BASELINE, coverage: [] };
   }
   const sorted = [...sessions].sort((a, b) => (a.date < b.date ? -1 : 1));
-  const allNames = new Set(Object.keys(EXERCISE_META));
-  sorted.forEach((s) => s.exercises.forEach((e) => allNames.add(e.name)));
 
-  const exState = {}; // name -> { lastP, lastDate }
+  const exState = {}; // slot id -> { lastP, lastDate, viaName }
   let rating = RATING_BASELINE;
   let prevDate = null;
   const trajectory = [];
@@ -656,17 +924,16 @@ function computeEloTrajectory(sessions, bodyweightKg) {
     }
 
     session.exercises.forEach((e) => {
-      const p = performanceIndex(e, bodyweightKg);
+      const p = performanceIndex(e, bodyweightKg, metaForEntry(e, prog));
       if (p !== null) {
-        exState[e.name] = { lastP: p, lastDate: session.date };
+        exState[slotIdOf(e)] = { lastP: p, lastDate: session.date, viaName: e.substituteFor ? e.name : null };
       }
     });
 
     let sumW = 0;
     let sumWP = 0;
-    allNames.forEach((name) => {
-      const meta = metaFor(name);
-      const st = exState[name];
+    slots.forEach((slot) => {
+      const st = exState[slot.id];
       let contribution;
       if (!st) {
         contribution = RATING_NEUTRAL;
@@ -675,8 +942,8 @@ function computeEloTrajectory(sessions, bodyweightKg) {
         const decay = Math.pow(0.5, daysSince / RATING_HALF_LIFE_DAYS);
         contribution = RATING_NEUTRAL + (st.lastP - RATING_NEUTRAL) * decay;
       }
-      sumW += meta.multiplier;
-      sumWP += meta.multiplier * contribution;
+      sumW += slot.meta.multiplier;
+      sumWP += slot.meta.multiplier * contribution;
     });
     const pRolling = sumWP / sumW;
     const expected = expectedPFromRating(rating);
@@ -690,15 +957,13 @@ function computeEloTrajectory(sessions, bodyweightKg) {
 
   // Coverage snapshot as of the latest session — which exercises are "fresh" vs decaying vs untouched.
   const latestDate = sorted[sorted.length - 1].date;
-  const coverage = Array.from(allNames)
-    .filter((n) => EXERCISE_META[n]) // only show program exercises, not one-off custom ones
-    .map((name) => {
-      const st = exState[name];
-      if (!st) return { name, status: "untouched", daysSince: null };
-      const daysSince = diffDaysBetween(latestDate, st.lastDate);
-      const status = daysSince <= 3 ? "fresh" : daysSince <= RATING_HALF_LIFE_DAYS ? "fading" : "stale";
-      return { name, status, daysSince };
-    });
+  const coverage = slots.map((slot) => {
+    const st = exState[slot.id];
+    if (!st) return { id: slot.id, name: slot.name, status: "untouched", daysSince: null, viaName: null };
+    const daysSince = diffDaysBetween(latestDate, st.lastDate);
+    const status = daysSince <= 3 ? "fresh" : daysSince <= RATING_HALF_LIFE_DAYS ? "fading" : "stale";
+    return { id: slot.id, name: slot.name, status, daysSince, viaName: st.viaName };
+  });
 
   return { trajectory, rating: Math.round(rating), coverage };
 }
@@ -730,23 +995,39 @@ function repTargetCeiling(target) {
   return m ? Number(m[2]) : null;
 }
 
-function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall }) {
+function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall, program }) {
   const notes = [];
 
   programExercises.forEach((pe) => {
-    const prev = lastSameDay && lastSameDay.exercises.find((e) => e.name === pe.name);
+    // Match on id, not name: renaming a lift must not orphan its history.
+    const entries = (lastSameDay && lastSameDay.exercises) || [];
+    const prev = entries.find((e) => e.id === pe.id && !e.substituteFor);
+
     if (!prev || !prev.sets || prev.sets.length === 0) {
-      notes.push({ name: pe.name, note: "No history yet — pick a weight you can control for all reps." });
+      // If the slot was filled by a substitute last time, say so rather than claiming there's
+      // no history. Quoting the substitute's weights here would be actively misleading — a
+      // leg extension's 40kg is not a leg press's 40kg.
+      const sub = entries.find((e) => e.substituteFor === pe.id && e.sets && e.sets.length);
+      if (sub) {
+        notes.push({
+          id: pe.id,
+          name: pe.name,
+          note: `Last time you swapped in ${sub.name} here, so there's no recent number for this lift. Start from what you remember and stay conservative.`,
+        });
+        return;
+      }
+      notes.push({ id: pe.id, name: pe.name, note: "No history yet — pick a weight you can control for all reps." });
       return;
     }
     if (noteSignalsProblem(prev.notes)) {
       notes.push({
+        id: pe.id,
         name: pe.name,
         note: "Your last note flagged discomfort here — drop the weight, focus on form, and stop if it recurs.",
       });
       return;
     }
-    const meta = metaFor(pe.name);
+    const meta = metaForEntry(pe, program);
     const ceiling = repTargetCeiling(pe.target);
     const lastSet = prev.sets[prev.sets.length - 1];
     const topSet = topSetOf(prev);
@@ -754,6 +1035,7 @@ function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall }) {
 
     if (meta.type === "duration" || meta.type === "reps") {
       notes.push({
+        id: pe.id,
         name: pe.name,
         note: `Last time: ${topSet.reps}${meta.type === "duration" ? "s" : " reps"}. Aim to beat it by a little.`,
       });
@@ -762,6 +1044,7 @@ function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall }) {
     if (ceiling && lastSet.reps >= ceiling && !hadDrops) {
       const bump = topSet.weight >= 20 ? 2.5 : topSet.weight >= 10 ? 2 : 1;
       notes.push({
+        id: pe.id,
         name: pe.name,
         note: `Hit the top of the range at ${topSet.weight}kg — try ${topSet.weight + bump}kg today.`,
       });
@@ -769,12 +1052,13 @@ function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall }) {
     }
     if (hadDrops) {
       notes.push({
+        id: pe.id,
         name: pe.name,
         note: `You went to failure with drops at ${topSet.weight}kg — repeat that weight and aim for cleaner reps.`,
       });
       return;
     }
-    notes.push({ name: pe.name, note: `Stay at ${topSet.weight}kg and try to add a rep or two.` });
+    notes.push({ id: pe.id, name: pe.name, note: `Stay at ${topSet.weight}kg and try to add a rep or two.` });
   });
 
   let overall;
@@ -822,18 +1106,34 @@ function CoachPanel({ analysis, onStart }) {
 
 const DRAFT_KEY = "draft_v1";
 
-function LogView({ onSave, timer, sessions }) {
-  const [day, setDay] = useState(DAYS[0]);
+// Turn a program exercise into a blank log entry. The id travels with it — that's what ties
+// the logged sets back to the right slot in the rating and the coach.
+function logEntryFor(progEx) {
+  return {
+    id: progEx.id,
+    name: progEx.name,
+    muscle: progEx.muscle || "",
+    rest: progEx.rest || DEFAULT_REST,
+    link: progEx.link || "",
+    target: progEx.target || "",
+    notes: "",
+    sets: [],
+  };
+}
+
+function LogView({ onSave, timer, sessions, program }) {
+  const days = program.days;
+  const [dayId, setDayId] = useState(() => (days[0] ? days[0].id : ""));
   const [date, setDate] = useState(todayISO());
   const [duration, setDuration] = useState("");
-  const [exercises, setExercises] = useState(() =>
-    PROGRAM[DAYS[0]].exercises.map((e) => emptyExerciseLog(e.name, e.muscle, e.rest, e.link))
-  );
+  const [exercises, setExercises] = useState(() => exercisesForDay(program, days[0] ? days[0].id : "").map(logEntryFor));
   const [justSaved, setJustSaved] = useState(false);
   const [analysis, setAnalysis] = useState(null); // null | { overall, exercises }
   const [restored, setRestored] = useState(false);
   const [draftState, setDraftState] = useState("idle"); // idle | saving | saved
   const draftTimer = useRef(null);
+
+  const day = dayById(program, dayId) || days[0] || { id: "", name: "", subtitle: "" };
 
   // Restore an in-progress workout on open, so closing the app mid-session never loses sets.
   useEffect(() => {
@@ -844,10 +1144,13 @@ function LogView({ onSave, timer, sessions }) {
           const d = JSON.parse(raw);
           const hasWork = d.exercises && d.exercises.some((e) => e.sets && e.sets.length > 0);
           if (hasWork) {
-            setDay(d.day || DAYS[0]);
+            // Drafts written before ids existed, or against a day that has since been
+            // renamed or deleted, still restore — never lose logged work over a schema detail.
+            const restoredDayId = d.dayId || slugId(d.day || "");
+            if (dayById(program, restoredDayId)) setDayId(restoredDayId);
             setDate(d.date || todayISO());
             setDuration(d.duration || "");
-            setExercises(d.exercises);
+            setExercises(d.exercises.map((e) => ({ ...e, id: e.id || slugId(e.name) })));
           }
         } catch (e) { /* ignore malformed draft */ }
       }
@@ -863,31 +1166,32 @@ function LogView({ onSave, timer, sessions }) {
     draftTimer.current = setTimeout(async () => {
       if (!hasWork) return;
       setDraftState("saving");
-      const payload = JSON.stringify({ day, date, duration, exercises });
+      const payload = JSON.stringify({ day: day.name, dayId, date, duration, exercises });
       const ok = payload.length <= 4000 ? await cloud.set(DRAFT_KEY, payload) : false;
       setDraftState(ok ? "saved" : "idle");
       if (ok) setTimeout(() => setDraftState("idle"), 1500);
     }, 700);
     return () => draftTimer.current && clearTimeout(draftTimer.current);
-  }, [day, date, duration, exercises, restored]);
+  }, [dayId, day.name, date, duration, exercises, restored]);
 
-  function changeDay(newDay) {
-    setDay(newDay);
-    setExercises(PROGRAM[newDay].exercises.map((e) => emptyExerciseLog(e.name, e.muscle, e.rest, e.link)));
+  function changeDay(newDayId) {
+    setDayId(newDayId);
+    setExercises(exercisesForDay(program, newDayId).map(logEntryFor));
     setAnalysis(null);
   }
 
   function handleStartWorkout() {
     const sameDaySessions = (sessions || [])
-      .filter((s) => s.day === day)
+      .filter((s) => (s.dayId || slugId(s.day)) === dayId)
       .sort((a, b) => (a.date < b.date ? 1 : -1));
     const allSorted = [...(sessions || [])].sort((a, b) => (a.date < b.date ? 1 : -1));
     setAnalysis(
       buildLocalCoach({
-        day,
-        programExercises: PROGRAM[day].exercises,
+        day: day.name,
+        programExercises: exercisesForDay(program, dayId),
         lastSameDay: sameDaySessions[0] || null,
         lastOverall: allSorted[0] || null,
+        program,
       })
     );
   }
@@ -896,8 +1200,33 @@ function LogView({ onSave, timer, sessions }) {
     setExercises((prev) => prev.map((e, i) => (i === idx ? updated : e)));
   }
 
+  // Today-only substitution. The slot being filled (substituteFor) is preserved across
+  // repeated swaps, so swapping twice doesn't chain and lose the original slot.
+  function substituteExercise(idx, replacement) {
+    const inProgram = programSlots(program).some((s) => s.id === replacement.id);
+    setExercises((prev) =>
+      prev.map((e, i) => {
+        if (i !== idx) return e;
+        const slot = e.substituteFor || e.id;
+        if (replacement.id === slot) {
+          // Swapped back to the original — drop the substitution rather than marking the
+          // exercise as a substitute for itself.
+          const { substituteFor, substituteForName, ...rest } = e;
+          return { ...rest, ...logEntryFor(replacement) };
+        }
+        const entry = { ...logEntryFor(replacement), substituteFor: slot, substituteForName: e.substituteForName || e.name };
+        // An off-program substitute has nowhere else to keep its benchmark, so it carries a
+        // copy. Program exercises deliberately don't, so that editing the program later
+        // re-contextualises their history instead of freezing it at log time.
+        if (!inProgram) entry.meta = replacement.meta || metaFromPattern(replacement.pattern);
+        return entry;
+      })
+    );
+    setAnalysis(null);
+  }
+
   function addCustomExercise() {
-    setExercises((prev) => [...prev, emptyExerciseLog("New exercise", "", DEFAULT_REST)]);
+    setExercises((prev) => [...prev, { ...emptyExerciseLog("New exercise", "", DEFAULT_REST), id: "one-off-" + uid() }]);
   }
 
   function removeExercise(idx) {
@@ -911,7 +1240,8 @@ function LogView({ onSave, timer, sessions }) {
     const session = {
       id: uid(),
       date,
-      day,
+      day: day.name,
+      dayId,
       duration: duration ? Number(duration) : null,
       exercises: exercises.filter((e) => e.sets.length > 0),
     };
@@ -919,7 +1249,7 @@ function LogView({ onSave, timer, sessions }) {
     await cloud.remove(DRAFT_KEY);
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 2000);
-    setExercises(PROGRAM[day].exercises.map((e) => emptyExerciseLog(e.name, e.muscle, e.rest, e.link)));
+    setExercises(exercisesForDay(program, dayId).map(logEntryFor));
     setDuration("");
     setAnalysis(null);
   }
@@ -928,21 +1258,22 @@ function LogView({ onSave, timer, sessions }) {
     <div className="px-4 pt-4">
       <QuickTimer timer={timer} />
 
-      {/* Day selector */}
-      <div className="grid grid-cols-4 gap-1.5 mb-4">
-        {DAYS.map((d) => (
+      {/* Day selector. Two columns once there are more than four days, because the program
+          is user-editable now and a fixed 4-wide grid squeezes them unreadably thin. */}
+      <div className={`grid gap-1.5 mb-4 ${days.length > 4 ? "grid-cols-3" : "grid-cols-4"}`}>
+        {days.map((d) => (
           <button
-            key={d}
-            onClick={() => changeDay(d)}
+            key={d.id}
+            onClick={() => changeDay(d.id)}
             className={`rounded-lg py-2 text-xs font-semibold leading-tight transition-colors ${
-              day === d ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-500"
+              dayId === d.id ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-500"
             }`}
           >
-            {d}
+            {d.name}
           </button>
         ))}
       </div>
-      <p className="text-xs text-gray-500 mb-4">{PROGRAM[day].subtitle}</p>
+      {day.subtitle && <p className="text-xs text-gray-500 mb-4">{day.subtitle}</p>}
 
       {/* Coach: pre-workout analysis */}
       <CoachPanel analysis={analysis} onStart={handleStartWorkout} />
@@ -975,18 +1306,23 @@ function LogView({ onSave, timer, sessions }) {
       {/* Exercises */}
       <div className="space-y-3">
         {exercises.map((ex, idx) => {
+          // Matched on the slot, so a substituted card still shows the advice for the slot
+          // it's filling rather than falling silent.
+          const slot = ex.substituteFor || ex.id;
           const coachNote =
             analysis && typeof analysis === "object"
-              ? (analysis.exercises || []).find((a) => a.name === ex.name)?.note
+              ? (analysis.exercises || []).find((a) => a.id === slot)?.note
               : null;
           return (
             <ExerciseCard
               key={idx}
               exercise={ex}
-              target={PROGRAM[day].exercises[idx]?.target}
+              target={ex.target}
               timer={timer}
               coachNote={coachNote}
+              program={program}
               onChange={(updated) => updateExercise(idx, updated)}
+              onSubstitute={(replacement) => substituteExercise(idx, replacement)}
               onRemove={() => removeExercise(idx)}
             />
           );
@@ -997,8 +1333,12 @@ function LogView({ onSave, timer, sessions }) {
         onClick={addCustomExercise}
         className="w-full mt-3 flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-gray-200 text-gray-500 text-sm py-2.5 hover:border-gray-300 hover:text-gray-900 transition-colors"
       >
-        <Plus size={15} /> Add exercise
+        <Plus size={15} /> Add a one-off exercise
       </button>
+      <p className="text-xs text-gray-400 mt-1.5 text-center leading-snug">
+        One-offs are logged but don't count toward your rating — only exercises in your program do.
+        To swap a lift for today, use <span className="font-semibold">Swap</span> on its card.
+      </p>
 
       <button
         onClick={handleSave}
@@ -1081,10 +1421,151 @@ function toNumber(v) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }) {
+// ---------- Swap (today-only substitution) ----------
+// The machine you wanted is taken. Pick something else for today WITHOUT editing the program:
+// the work still counts toward the slot it replaced, so the rating doesn't read the original
+// as skipped. Editing the program itself is a different action, in the Program editor.
+function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel }) {
+  const [mode, setMode] = useState("pick"); // pick | custom
+  const [query, setQuery] = useState("");
+  const [customName, setCustomName] = useState("");
+
+  const byId = useMemo(() => {
+    const m = {};
+    (program.days || []).forEach((d) =>
+      (program.exercisesByDay[d.id] || []).forEach((e) => { if (!m[e.id]) m[e.id] = e; })
+    );
+    return m;
+  }, [program]);
+
+  // Default to the movement pattern of the lift being replaced. A substitute is nearly always
+  // the same movement — the machine was busy, not the goal — so this is both the likely answer
+  // and the one least able to distort the rating if left alone.
+  const slotExercise = byId[slotId];
+  const [customPattern, setCustomPattern] = useState(
+    (slotExercise && slotExercise.pattern) || inferPatternId(slotExercise && slotExercise.meta) || "isolation-upper"
+  );
+
+  const options = useMemo(
+    () => programSlots(program).filter((s) => s.id !== currentId).map((s) => byId[s.id]).filter(Boolean),
+    [program, currentId, byId]
+  );
+
+  const filtered = query.trim()
+    ? options.filter((e) => e.name.toLowerCase().includes(query.trim().toLowerCase()))
+    : options;
+
+  function pickCustom() {
+    const name = customName.trim();
+    if (!name) return;
+    onPick({
+      id: "sub-" + slugId(name) + "-" + uid().slice(-4),
+      name,
+      muscle: (patternById(customPattern) || {}).label || "",
+      target: "",
+      rest: DEFAULT_REST,
+      link: "",
+      pattern: customPattern,
+      meta: metaFromPattern(customPattern),
+    });
+  }
+
+  return (
+    <div className="mx-3.5 mb-3 rounded-md bg-white border border-gray-200 px-2.5 py-2.5">
+      <p className="text-xs text-gray-500 mb-2 leading-snug">
+        Swap this lift <span className="font-semibold">for today only</span>. Your program isn't
+        changed, and the work still counts toward this slot.
+      </p>
+
+      {loggedSets > 0 && (
+        <p className="text-xs text-maroon-700 mb-2 leading-snug">
+          The {loggedSets} set{loggedSets === 1 ? "" : "s"} already logged here belong to the current
+          exercise and will be cleared.
+        </p>
+      )}
+
+      <div className="flex gap-1.5 mb-2">
+        <button
+          onClick={() => setMode("pick")}
+          className={`flex-1 text-xs font-semibold rounded-md py-1.5 ${mode === "pick" ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-600"}`}
+        >
+          From my program
+        </button>
+        <button
+          onClick={() => setMode("custom")}
+          className={`flex-1 text-xs font-semibold rounded-md py-1.5 ${mode === "custom" ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-600"}`}
+        >
+          Something else
+        </button>
+      </div>
+
+      {mode === "pick" ? (
+        <>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search your exercises…"
+            className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+          />
+          <div className="max-h-56 overflow-y-auto space-y-1">
+            {filtered.length === 0 && <p className="text-xs text-gray-400 py-2">Nothing matches.</p>}
+            {filtered.map((e) => (
+              <button
+                key={e.id}
+                onClick={() => onPick(e)}
+                className="w-full text-left rounded-md border border-gray-200 px-2.5 py-2 hover:bg-gray-50"
+              >
+                <span className="block text-sm font-semibold truncate">{e.name}</span>
+                {e.muscle && <span className="block text-xs text-gray-500 truncate">{e.muscle}</span>}
+                {e.id === slotId && <span className="block text-xs text-maroon-600">the original for this slot</span>}
+              </button>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <input
+            value={customName}
+            onChange={(e) => setCustomName(e.target.value)}
+            placeholder="What are you doing instead?"
+            className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+          />
+          <p className="text-xs text-gray-500 mb-1 leading-snug">
+            Closest movement pattern — this is how it gets scored. Pre-set to match the lift
+            you're replacing; change it only if this is a genuinely different movement.
+          </p>
+          <select
+            value={customPattern}
+            onChange={(e) => setCustomPattern(e.target.value)}
+            style={{ colorScheme: "light" }}
+            className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+          >
+            {MOVEMENT_PATTERNS.map((p) => (
+              <option key={p.id} value={p.id}>{p.label} — {p.hint}</option>
+            ))}
+          </select>
+          <button
+            onClick={pickCustom}
+            disabled={!customName.trim()}
+            className={`w-full text-sm font-semibold rounded-md py-2 ${customName.trim() ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"}`}
+          >
+            Use this for today
+          </button>
+        </>
+      )}
+
+      <button onClick={onCancel} className="w-full mt-2 text-xs font-semibold text-gray-500 py-1.5">
+        Cancel
+      </button>
+    </div>
+  );
+}
+
+function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, onSubstitute, onRemove }) {
   const [weight, setWeight] = useState("");
   const [reps, setReps] = useState("");
   const [expanded, setExpanded] = useState(true);
+  const [swapOpen, setSwapOpen] = useState(false);
   const [restLen, setRestLen] = useState(exercise.rest || DEFAULT_REST);
   const [dropFormFor, setDropFormFor] = useState(null);
   const [dropWeight, setDropWeight] = useState("");
@@ -1192,6 +1673,13 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
   }
 
   const restPresets = [45, 60, 90, 120];
+  const slotId = exercise.substituteFor || exercise.id;
+  const slotMatch = exercise.substituteFor && program
+    ? programSlots(program).find((s) => s.id === exercise.substituteFor)
+    : null;
+  const originalName = (slotMatch && slotMatch.name) || exercise.substituteForName || null;
+  // One-off additions aren't in the program, so there's no slot for them to stand in for.
+  const canSwap = !!onSubstitute && !String(exercise.id || "").startsWith("one-off-");
 
   return (
     <div className="rounded-xl bg-gray-50 border border-gray-200 overflow-hidden">
@@ -1206,6 +1694,16 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
             {exercise.muscle && <p className="text-xs text-gray-500 truncate">{exercise.muscle}{target ? ` · target ${target}` : ""}</p>}
           </div>
         </button>
+        {canSwap && (
+          <button
+            onClick={() => setSwapOpen((v) => !v)}
+            className={`flex items-center gap-1 text-xs font-semibold rounded-md px-2 py-1.5 shrink-0 mr-1 ${
+              swapOpen ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-600"
+            }`}
+          >
+            <RotateCcw size={11} /> Swap
+          </button>
+        )}
         {exercise.link && (
           <a
             href={exercise.link}
@@ -1221,6 +1719,28 @@ function ExerciseCard({ exercise, target, timer, coachNote, onChange, onRemove }
           <X size={14} />
         </button>
       </div>
+
+      {/* Substitution badge. Says which slot is being filled, because that's what the rating
+          and the coach will attribute this work to. */}
+      {exercise.substituteFor && (
+        <div className="mx-3.5 mb-3 flex items-center gap-1.5 rounded-md bg-gray-100 border border-gray-200 px-2.5 py-2">
+          <RotateCcw size={12} className="text-gray-500 shrink-0" />
+          <p className="text-xs text-gray-600 leading-snug flex-1">
+            Standing in for <span className="font-semibold">{originalName || "another lift"}</span> today. It counts toward that slot.
+          </p>
+        </div>
+      )}
+
+      {swapOpen && (
+        <SwapPanel
+          program={program}
+          currentId={exercise.id}
+          slotId={slotId}
+          loggedSets={exercise.sets.length}
+          onPick={(replacement) => { setSwapOpen(false); onSubstitute(replacement); }}
+          onCancel={() => setSwapOpen(false)}
+        />
+      )}
 
       {coachNote && (
         <div className="mx-3.5 mb-3 flex items-start gap-1.5 rounded-md bg-maroon-50 border border-maroon-100 px-2.5 py-2">
@@ -1489,7 +2009,7 @@ function HistoryView({ sessions, onDelete }) {
 
 // ---------- Progress View ----------
 // ---------- Profile View ----------
-function ProfileView({ profile, onSave, sessions }) {
+function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
   const [heightCm, setHeightCm] = useState(profile.heightCm ?? "");
   const [weightKg, setWeightKg] = useState(profile.weightKg ?? "");
   const [displayName, setDisplayName] = useState(profile.displayName ?? "");
@@ -1572,7 +2092,24 @@ function ProfileView({ profile, onSave, sessions }) {
         </button>
       </div>
 
-      <ExportPanel sessions={sessions} profile={profile} />
+      <div className="mt-5 rounded-xl bg-gray-50 border border-gray-200 px-4 py-3.5">
+        <div className="flex items-center gap-1.5 mb-2">
+          <Dumbbell size={14} className="text-maroon-600" />
+          <p className="text-sm uppercase tracking-wider text-gray-500 font-semibold">Program</p>
+        </div>
+        <p className="text-sm text-gray-500 mb-3 leading-snug">
+          {program.days.length} day{program.days.length === 1 ? "" : "s"}, {programSlots(program).length} exercises.
+          Add your own lifts, change the days, or start from scratch.
+        </p>
+        <button
+          onClick={onEditProgram}
+          className="w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold bg-maroon-600 text-white"
+        >
+          <Dumbbell size={15} /> Edit program
+        </button>
+      </div>
+
+      <ExportPanel sessions={sessions} profile={profile} program={program} />
 
       <div className="mt-5 rounded-xl bg-maroon-50 border border-maroon-100 px-4 py-3">
         <p className="text-sm text-maroon-800 leading-snug">
@@ -1582,6 +2119,316 @@ function ProfileView({ profile, onSave, sessions }) {
           bodyweight are never in that line.
         </p>
       </div>
+    </div>
+  );
+}
+
+// ---------- Program editor ----------
+// The persistent half of the pair. Swap (SwapPanel) changes one workout; this changes the
+// program itself, for every session from here on. They're deliberately separate screens:
+// "the leg press is busy today" and "I don't do leg press any more" are different statements
+// and the rating treats them differently.
+//
+// Edits are held locally and written on Save, so a half-finished reshuffle never reaches
+// storage — and so one write covers a whole editing session rather than one per keystroke.
+function ProgramEditor({ program, onCommit, onReset, onBack }) {
+  const [draft, setDraft] = useState(program);
+  const [openDayId, setOpenDayId] = useState(program.days[0] ? program.days[0].id : null);
+  const [editingId, setEditingId] = useState(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [status, setStatus] = useState("");
+
+  const dirty = useMemo(
+    () => JSON.stringify({ d: draft.days, e: draft.exercisesByDay }) !== JSON.stringify({ d: program.days, e: program.exercisesByDay }),
+    [draft, program]
+  );
+
+  function setDayExercises(dayId, next) {
+    setDraft((p) => ({ ...p, exercisesByDay: { ...p.exercisesByDay, [dayId]: next } }));
+  }
+
+  function updateExercise(dayId, id, patch) {
+    setDayExercises(dayId, (draft.exercisesByDay[dayId] || []).map((e) => (e.id === id ? { ...e, ...patch } : e)));
+  }
+
+  function moveExercise(dayId, idx, delta) {
+    const list = [...(draft.exercisesByDay[dayId] || [])];
+    const to = idx + delta;
+    if (to < 0 || to >= list.length) return;
+    const [item] = list.splice(idx, 1);
+    list.splice(to, 0, item);
+    setDayExercises(dayId, list);
+  }
+
+  function removeExercise(dayId, id) {
+    setDayExercises(dayId, (draft.exercisesByDay[dayId] || []).filter((e) => e.id !== id));
+  }
+
+  function addExercise(dayId) {
+    // A fresh random id, not one derived from the name: renaming this later must not orphan
+    // the history it has already accumulated.
+    const id = "x" + uid().slice(-6);
+    const pattern = "push-horizontal";
+    const next = [
+      ...(draft.exercisesByDay[dayId] || []),
+      { id, name: "New exercise", muscle: "", target: "3 x 8-12", rest: DEFAULT_REST, link: "", pattern, meta: metaFromPattern(pattern) },
+    ];
+    setDayExercises(dayId, next);
+    setEditingId(id);
+  }
+
+  function addDay() {
+    const id = "d" + uid().slice(-6);
+    setDraft((p) => ({
+      ...p,
+      days: [...p.days, { id, name: `Day ${p.days.length + 1}`, subtitle: "" }],
+      exercisesByDay: { ...p.exercisesByDay, [id]: [] },
+    }));
+    setOpenDayId(id);
+  }
+
+  function updateDay(dayId, patch) {
+    setDraft((p) => ({ ...p, days: p.days.map((d) => (d.id === dayId ? { ...d, ...patch } : d)) }));
+  }
+
+  function removeDay(dayId) {
+    setDraft((p) => {
+      const days = p.days.filter((d) => d.id !== dayId);
+      const exercisesByDay = { ...p.exercisesByDay };
+      delete exercisesByDay[dayId];
+      return { ...p, days, exercisesByDay };
+    });
+  }
+
+  async function save() {
+    const res = await onCommit(draft);
+    if (res && res.ok) {
+      setStatus("Saved");
+      setTimeout(() => setStatus(""), 2000);
+    }
+  }
+
+  return (
+    <div className="px-4 pt-4">
+      <button onClick={onBack} className="flex items-center gap-1.5 text-sm text-gray-500 mb-3">
+        <ChevronDown size={15} className="rotate-90" /> Back to Profile
+      </button>
+
+      <h2 className="text-2xl font-bold tracking-tight mb-1">Your program</h2>
+      <p className="text-sm text-gray-500 mb-4 leading-snug">
+        Changes here apply to every future workout. To change just today's session — a busy
+        machine, say — use <span className="font-semibold">Swap</span> on the exercise card in the
+        Log tab instead.
+      </p>
+
+      <div className="space-y-2.5">
+        {draft.days.map((d) => {
+          const list = draft.exercisesByDay[d.id] || [];
+          const open = openDayId === d.id;
+          return (
+            <div key={d.id} className="rounded-xl bg-gray-50 border border-gray-200 overflow-hidden">
+              <button
+                onClick={() => setOpenDayId(open ? null : d.id)}
+                className="w-full flex items-center gap-2 px-3.5 py-3 text-left"
+              >
+                {open ? <ChevronUp size={15} className="text-gray-500 shrink-0" /> : <ChevronDown size={15} className="text-gray-500 shrink-0" />}
+                <span className="flex-1 min-w-0">
+                  <span className="block text-sm font-semibold truncate">{d.name}</span>
+                  <span className="block text-xs text-gray-500">{list.length} exercise{list.length === 1 ? "" : "s"}</span>
+                </span>
+              </button>
+
+              {open && (
+                <div className="px-3.5 pb-3.5">
+                  <div className="flex gap-1.5 mb-2.5">
+                    <input
+                      value={d.name}
+                      onChange={(e) => updateDay(d.id, { name: e.target.value })}
+                      placeholder="Day name"
+                      className="flex-1 min-w-0 bg-white rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+                    />
+                    <button
+                      onClick={() => removeDay(d.id)}
+                      disabled={draft.days.length <= 1}
+                      className={`shrink-0 rounded-md px-2.5 ${draft.days.length <= 1 ? "bg-gray-100 text-gray-300" : "bg-gray-100 text-gray-600"}`}
+                      title={draft.days.length <= 1 ? "A program needs at least one day" : "Delete this day"}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                  <input
+                    value={d.subtitle || ""}
+                    onChange={(e) => updateDay(d.id, { subtitle: e.target.value })}
+                    placeholder="Short description (optional)"
+                    className="w-full mb-3 bg-white rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+                  />
+
+                  <div className="space-y-1.5">
+                    {list.map((e, idx) => (
+                      <ProgramExerciseRow
+                        key={e.id}
+                        exercise={e}
+                        editing={editingId === e.id}
+                        canMoveUp={idx > 0}
+                        canMoveDown={idx < list.length - 1}
+                        onToggleEdit={() => setEditingId(editingId === e.id ? null : e.id)}
+                        onChange={(patch) => updateExercise(d.id, e.id, patch)}
+                        onMove={(delta) => moveExercise(d.id, idx, delta)}
+                        onRemove={() => removeExercise(d.id, e.id)}
+                      />
+                    ))}
+                    {list.length === 0 && (
+                      <p className="text-xs text-gray-400 py-2">No exercises on this day yet.</p>
+                    )}
+                  </div>
+
+                  <button
+                    onClick={() => addExercise(d.id)}
+                    className="w-full mt-2 flex items-center justify-center gap-1.5 rounded-md border border-dashed border-gray-300 text-gray-500 text-sm py-2"
+                  >
+                    <Plus size={15} /> Add exercise
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <button
+        onClick={addDay}
+        className="w-full mt-3 flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-gray-200 text-gray-500 text-sm py-2.5"
+      >
+        <Plus size={15} /> Add a day
+      </button>
+
+      <button
+        onClick={save}
+        disabled={!dirty}
+        className={`w-full mt-5 flex items-center justify-center gap-2 rounded-lg py-3 text-sm font-semibold ${
+          dirty ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-400"
+        }`}
+      >
+        {status || (dirty ? <><Save size={16} /> Save program</> : "No changes")}
+      </button>
+
+      <div className="mt-5 rounded-xl bg-gray-50 border border-gray-200 px-4 py-3">
+        <p className="text-sm text-gray-500 leading-snug mb-2">
+          Your rating is calculated across the exercises in this program. Removing one stops it
+          counting against you; adding one starts it counting as untrained until you log it.
+          Past sessions are kept either way.
+        </p>
+        {confirmReset ? (
+          <div className="flex gap-1.5">
+            <button
+              onClick={() => { setConfirmReset(false); onReset(); }}
+              className="flex-1 bg-maroon-600 text-white text-sm font-semibold rounded-md py-2"
+            >
+              Yes, restore the default
+            </button>
+            <button onClick={() => setConfirmReset(false)} className="flex-1 bg-white border border-gray-200 text-gray-600 text-sm font-semibold rounded-md py-2">
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button onClick={() => setConfirmReset(true)} className="text-sm font-semibold text-gray-600">
+            Restore the built-in 4-day split
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProgramExerciseRow({ exercise, editing, canMoveUp, canMoveDown, onToggleEdit, onChange, onMove, onRemove }) {
+  const pattern = patternById(exercise.pattern) || null;
+
+  return (
+    <div className="rounded-md bg-white border border-gray-200">
+      <div className="flex items-center gap-1 px-2.5 py-2">
+        <button onClick={onToggleEdit} className="flex-1 min-w-0 text-left">
+          <span className="block text-sm font-semibold truncate">{exercise.name}</span>
+          <span className="block text-xs text-gray-500 truncate">
+            {exercise.target || "no target"}{pattern ? ` · ${pattern.label}` : ""}
+          </span>
+        </button>
+        <button
+          onClick={() => onMove(-1)}
+          disabled={!canMoveUp}
+          className={`shrink-0 rounded p-1.5 ${canMoveUp ? "text-gray-600 bg-gray-100" : "text-gray-300"}`}
+        >
+          <ChevronUp size={14} />
+        </button>
+        <button
+          onClick={() => onMove(1)}
+          disabled={!canMoveDown}
+          className={`shrink-0 rounded p-1.5 ${canMoveDown ? "text-gray-600 bg-gray-100" : "text-gray-300"}`}
+        >
+          <ChevronDown size={14} />
+        </button>
+        <button onClick={onRemove} className="shrink-0 rounded p-1.5 text-gray-500 bg-gray-100">
+          <X size={14} />
+        </button>
+      </div>
+
+      {editing && (
+        <div className="px-2.5 pb-2.5 space-y-1.5 border-t border-gray-100 pt-2.5">
+          <input
+            value={exercise.name}
+            onChange={(e) => onChange({ name: e.target.value })}
+            placeholder="Exercise name"
+            className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+          />
+          <input
+            value={exercise.muscle || ""}
+            onChange={(e) => onChange({ muscle: e.target.value })}
+            placeholder="Muscles worked (optional)"
+            className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+          />
+          <div className="flex gap-1.5">
+            <input
+              value={exercise.target || ""}
+              onChange={(e) => onChange({ target: e.target.value })}
+              placeholder="3 x 8-12"
+              className="flex-1 min-w-0 bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+            />
+            <input
+              type="text"
+              inputMode="numeric"
+              value={exercise.rest || ""}
+              onChange={(e) => onChange({ rest: Number(toNumber(e.target.value)) || DEFAULT_REST })}
+              placeholder="rest s"
+              className="w-24 bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+            />
+          </div>
+          <input
+            value={exercise.link || ""}
+            onChange={(e) => onChange({ link: e.target.value })}
+            placeholder="Form video link (optional)"
+            className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+          />
+          <p className="text-xs text-gray-500 pt-1 leading-snug">
+            Movement pattern — the rating has no benchmark for a lift it's never seen, so it
+            borrows the pattern's. Rough family averages, not measurements of this exercise.
+          </p>
+          <select
+            value={exercise.pattern || "isolation-upper"}
+            onChange={(e) => onChange({ pattern: e.target.value, meta: metaFromPattern(e.target.value) })}
+            style={{ colorScheme: "light" }}
+            className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+          >
+            {MOVEMENT_PATTERNS.map((p) => (
+              <option key={p.id} value={p.id}>{p.label} — {p.hint}</option>
+            ))}
+          </select>
+          {exercise.builtIn && (
+            <p className="text-xs text-gray-400 leading-snug">
+              This is one of the built-in lifts. Changing its pattern overrides the benchmark it
+              shipped with.
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1615,10 +2462,12 @@ function describeSet(s) {
   return `${s.weight}kg×${s.reps}` + (s.drops || []).map((d) => ` → ${d.weight}kg×${d.reps}`).join("");
 }
 
-function buildExportMarkdown(sessions, profile, rangeLabel) {
+function buildExportMarkdown(sessions, profile, rangeLabel, program) {
   const sorted = [...sessions].sort((a, b) => (a.date < b.date ? 1 : -1));
   const weight = Number(profile.weightKg) || null;
-  const elo = computeEloTrajectory(sorted, weight);
+  const elo = computeEloTrajectory(sorted, weight, program);
+  const slotNames = {};
+  if (program) programSlots(program).forEach((s) => { slotNames[s.id] = s.name; });
   const L = [];
 
   L.push("# Chetamba training export");
@@ -1646,12 +2495,25 @@ function buildExportMarkdown(sessions, profile, rangeLabel) {
   L.push("");
   L.push("## Day balance");
   L.push("");
-  DAYS.forEach((d) => {
-    const n = sorted.filter((s) => s.day === d).length;
-    L.push(`- ${d}: ${n}`);
+  const progDays = (program && program.days) || DEFAULT_PROGRAM.days;
+  progDays.forEach((d) => {
+    const n = sorted.filter((s) => (s.dayId || slugId(s.day)) === d.id).length;
+    L.push(`- ${d.name}: ${n}`);
   });
-  const other = sorted.filter((s) => !DAYS.includes(s.day)).length;
-  if (other) L.push(`- Other/custom: ${other}`);
+  const dayIds = new Set(progDays.map((d) => d.id));
+  const other = sorted.filter((s) => !dayIds.has(s.dayId || slugId(s.day))).length;
+  if (other) L.push(`- Days no longer in the program: ${other}`);
+
+  // The program itself, so a reviewer can tell "not in the program" from "skipped".
+  L.push("");
+  L.push("## Current program");
+  progDays.forEach((d) => {
+    L.push("");
+    L.push(`**${d.name}**${d.subtitle ? ` — ${d.subtitle}` : ""}`);
+    exercisesForDay(program || DEFAULT_PROGRAM, d.id).forEach((e) => {
+      L.push(`- ${e.name}${e.target ? ` — ${e.target}` : ""}`);
+    });
+  });
 
   // Anything the notes flagged as painful, pulled from the logs rather than hard-coded, so
   // this stays correct if someone else uses the app.
@@ -1677,10 +2539,14 @@ function buildExportMarkdown(sessions, profile, rangeLabel) {
     L.push(`### ${s.date} · ${s.day}${s.duration ? ` · ${s.duration} min` : ""}`);
     L.push("");
     s.exercises.forEach((e) => {
-      const meta = metaFor(e.name);
+      const meta = metaForEntry(e, program);
       const sets = e.sets.map(describeSet).join(", ");
       const unit = meta.type === "duration" ? " (reps column is seconds)" : "";
-      L.push(`- **${e.name}**: ${sets || "no sets logged"}${unit}`);
+      // Flag substitutions inline. A reviewer comparing week to week would otherwise read a
+      // one-off swap as the athlete abandoning a lift.
+      const slot = e.substituteFor ? (slotNames[e.substituteFor] || e.substituteForName) : null;
+      const via = slot ? ` _(swapped in for ${slot} that day)_` : "";
+      L.push(`- **${e.name}**: ${sets || "no sets logged"}${unit}${via}`);
       if (e.notes) L.push(`  - note: "${String(e.notes).trim()}"`);
     });
   });
@@ -1714,7 +2580,7 @@ function buildExportJSON(sessions, profile) {
   );
 }
 
-function ExportPanel({ sessions, profile }) {
+function ExportPanel({ sessions, profile, program }) {
   const [rangeId, setRangeId] = useState("4w");
   const [copied, setCopied] = useState("");
   const [fallback, setFallback] = useState("");
@@ -1773,7 +2639,7 @@ function ExportPanel({ sessions, profile }) {
       </p>
 
       <button
-        onClick={() => copy(buildExportMarkdown(scoped, profile, range.label), "md")}
+        onClick={() => copy(buildExportMarkdown(scoped, profile, range.label, program), "md")}
         disabled={scoped.length === 0}
         className={`w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold mb-1.5 ${
           scoped.length === 0 ? "bg-gray-200 text-gray-400" : "bg-maroon-600 text-white"
@@ -2054,7 +2920,7 @@ function Leaderboard({ displayName, rating, tierName }) {
   );
 }
 
-function ProgressView({ sessions, profile }) {
+function ProgressView({ sessions, profile, program }) {
   const exerciseNames = useMemo(() => {
     const set = new Set();
     sessions.forEach((s) => s.exercises.forEach((e) => set.add(e.name)));
@@ -2068,8 +2934,8 @@ function ProgressView({ sessions, profile }) {
   }, [exerciseNames, selected]);
 
   const eloResult = useMemo(
-    () => computeEloTrajectory(sessions, Number(profile.weightKg) || null),
-    [sessions, profile.weightKg]
+    () => computeEloTrajectory(sessions, Number(profile.weightKg) || null, program),
+    [sessions, profile.weightKg, program]
   );
 
   const data = useMemo(() => {

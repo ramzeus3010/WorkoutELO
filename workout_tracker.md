@@ -6,9 +6,9 @@ Handover doc for **Chetamba** — a workout tracker running as a Telegram Mini A
 > changing anything. **Update it in the same commit as any change** — see
 > [Maintaining this doc](#maintaining-this-doc) at the bottom.
 
-Last updated: 2026-08-13 · Status: app builds clean, all five suites green, **Pages deploy
+Last updated: 2026-08-14 · Status: app builds clean, all six suites green, **Pages deploy
 and bot webhook not yet verified live** · Next up:
-[editable exercises](#12-next-session--editable--custom-exercises)
+[AI-generated programs](#12a-ai-generated-programs--the-blocker-to-solve-first)
 
 ---
 
@@ -70,7 +70,7 @@ rejected as unnecessary once Telegram CloudStorage covered the storage need.
 ├── package.json
 ├── .gitignore           ← ignores node_modules; deliberately does NOT ignore dist/
 ├── src/
-│   ├── app.jsx          ← the entire app (~1700 lines, single file by design)
+│   ├── app.jsx          ← the entire app (~2900 lines, single file by design)
 │   └── main.jsx         ← mounts <App/> into #root; also calls tg.ready()/expand()
 ├── dist/
 │   ├── index.html       ← page shell; loads Telegram SDK + Tailwind CDN + app.js
@@ -85,6 +85,7 @@ rejected as unnecessary once Telegram CloudStorage covered the storage need.
     ├── test-autosave.mjs← logs a set, kills app, reopens, asserts restore
     ├── test-flow.mjs    ← coach + keyboard + rating + leaderboard end-to-end
     ├── test-export.mjs  ← markdown + JSON export content and round-tripping (§8a)
+    ├── test-program.mjs ← program editing, substitution, and the rating trap (§12)
     └── test-bot.mjs     ← bot webhook, with the Telegram API stubbed (no network)
 ```
 
@@ -92,8 +93,9 @@ rejected as unnecessary once Telegram CloudStorage covered the storage need.
 build step, so the built bundle must be in the repo. **Rebuild before every push**, or the
 deployed app silently stays on the old code.
 
-The bundle is an IIFE and exports nothing, so all three suites drive the real UI through
-jsdom rather than importing functions. `tests/dom.mjs` holds the shared setup: it stubs
+The bundle is an IIFE and exports nothing, so every UI suite drives the real app through
+jsdom rather than importing functions (`test-bot.mjs` is the exception — it imports the
+worker directly, since that isn't part of the bundle). `tests/dom.mjs` holds the shared setup: it stubs
 `AudioContext`, `requestAnimationFrame`, `getBoundingClientRect` and **`ResizeObserver`**
 (recharts' `ResponsiveContainer` throws without it in jsdom; real browsers have it). Any
 new test should import from there rather than rebuilding its own DOM.
@@ -103,7 +105,7 @@ new test should import from there rather than rebuilding its own DOM.
 ```bash
 npm install
 npm run build     # src/ -> dist/app.js
-npm test          # build + all five suites
+npm test          # build + all six suites
 ```
 
 The bot is deployed separately and is not part of `npm run build` — see `bot/README.md`.
@@ -121,23 +123,30 @@ Roughly in file order:
 
 | Lines | Section |
 |---|---|
-| 1–4 | Imports (react, react-dom/client portal, lucide-react, recharts) |
-| ~8–62 | `PROGRAM` — the 4-day split, exercise definitions and form links |
-| ~64–105 | Rating config: `EXERCISE_META`, `TIERS`, tuning constants |
-| ~109–192 | **Telegram bridge + storage layer** (§5) |
-| ~195–260 | `emptyExerciseLog`, `playBeep`, `useRestTimer` |
-| ~263–355 | `App` — tab state, loads sessions/profile, save handlers |
-| ~356–405 | `Header`, `BottomNav` |
-| ~406–510 | **Rest timer UI**: `useViewportBox`, `RestRing`, `RestReadout` (§9a) |
-| ~513–570 | `QuickTimer` |
-| ~573–705 | **Rating engine** (§6) |
-| ~721–795 | **Local coach** (§7) |
-| ~799–1020 | `CoachPanel`, `LogView` (incl. draft autosave) |
-| ~1025–1082 | **Keyboard accessory bar**: `useKeyboardOffset`, `KeyboardAccessory`, `toNumber` (§9b) |
-| ~1084–1410 | `ExerciseCard` — sets, drop sets, notes, per-exercise rest |
-| ~1413–1580 | `HistoryView`, `ProfileView` |
-| ~1585–1820 | `RatingCard`, **Leaderboard** (§8) |
-| ~1826+ | `ProgressView` — rating card, leaderboard, per-exercise charts |
+| 1–4 | Imports (react, react-dom portal, lucide-react, recharts) |
+| ~8–56 | `PROGRAM` — the built-in split, now only the **default** for a new user (§12) |
+| ~58–105 | Rating config: `EXERCISE_META`, `TIERS`, tuning constants |
+| ~107–160 | `slugId`, `MOVEMENT_PATTERNS` — exercise identity and benchmarks (§12) |
+| ~162–235 | `DEFAULT_PROGRAM`, `withMetaIndex`, `metaForEntry`, `programSlots` (§12) |
+| ~237–330 | **Telegram bridge + storage layer** (§5), `normalizeSession` migration |
+| ~330–400 | **Program storage**: `loadProgram`, `saveProgram`, `resetProgram` (§12) |
+| ~405–470 | `emptyExerciseLog`, `playBeep`, `useRestTimer` |
+| ~465–570 | `App` — tab state, loads sessions/profile/program, save handlers |
+| ~570–620 | `Header`, `BottomNav` |
+| ~620–720 | **Rest timer UI**: `useViewportBox`, `RestRing`, `RestReadout` (§9a) |
+| ~725–790 | `QuickTimer` |
+| ~800–935 | **Rating engine** (§6, §12) |
+| ~950–1030 | **Local coach** (§7) |
+| ~1035–1270 | `CoachPanel`, `LogView` (draft autosave, day selection, substitution) |
+| ~1280–1340 | **Keyboard accessory bar** (§9b) |
+| ~1345–1500 | `SwapPanel` — today-only substitution (§12) |
+| ~1500–1800 | `ExerciseCard` — sets, drop sets, notes, swap, per-exercise rest |
+| ~1800–1980 | `HistoryView` |
+| ~1980–2100 | `ProfileView` — bodyweight, program entry point, export |
+| ~2100–2400 | `ProgramEditor`, `ProgramExerciseRow` (§12) |
+| ~2400–2620 | **Export** (§8a) |
+| ~2620–2900 | `RatingCard`, **Leaderboard** (§8) |
+| ~2900+ | `ProgressView` |
 
 Line numbers drift as the file changes; treat them as a map, not gospel. Grep for the
 function name.
@@ -181,6 +190,8 @@ The 4096 cap is why sessions are **not** stored as one blob:
 | `sess_index` | JSON array of session ids |
 | `sess_<id>` | one full session |
 | `profile` | height, weight, display name |
+| `prog_v1` | program index: `{version, days:[{id,name,subtitle}]}` (§12) |
+| `prog_d_<dayId>` | one program day's exercise list (§12) |
 | `draft_v1` | the in-progress workout (§ autosave) |
 | `rivals_v1` | friends' pasted scores |
 
@@ -217,8 +228,11 @@ run through Elo-style update maths so it moves like a game rank.
 1. **Layoff penalty first.** Gap since the previous session, minus a 7-day grace, decays
    the rating toward baseline with a 21-day half-life. A week off costs nothing; a month
    costs ~425 points; three months lands near baseline. Never drops below 400.
-2. **Every program exercise contributes**, weighted by `multiplier` in `EXERCISE_META`
-   (compounds 1.5, accessories ~0.75, calves/core ~0.5).
+2. **Every exercise in the user's current program contributes** (`programSlots`), weighted
+   by its `multiplier` (compounds 1.5, accessories ~0.75, calves/core ~0.5). Since §12 the
+   denominator is the **live program**, not every name ever logged — so removing an exercise
+   stops it counting, and one-off logged extras never count. See §12 for slots and
+   substitution.
 3. **Untouched exercises decay toward neutral 1.0, not zero** (14-day half-life). This is
    deliberate: skipping one lift *slows* progress but can never freeze or reverse it.
    He explicitly asked for this. Don't turn it into a hard zero.
@@ -226,7 +240,9 @@ run through Elo-style update maths so it moves like a game rank.
    then 16.
 
 Weight comes from the Profile tab and is applied to **the whole history on every
-recalculation**, so cutting or bulking re-contextualises past sessions too.
+recalculation**, so cutting or bulking re-contextualises past sessions too. An exercise's
+movement pattern behaves the same way — change it in the editor and its whole history is
+rescored (see the `metaForEntry` lookup order in §12).
 
 ### Honesty note
 
@@ -249,7 +265,13 @@ today's planned exercises against the most recent session of the same day.
 | Hit top of rep range, no drop sets | Bump weight (+1/+2/+2.5 kg by load) |
 | Used drop sets | Repeat same weight, cleaner reps |
 | Otherwise | Same weight, add a rep |
+| Slot was filled by a substitute last time | Say so; **quote no numbers** |
 | No history | Neutral encouragement, no invented numbers |
+
+Matching is by exercise **id**, not name (§12), and deliberately excludes substitutes:
+a leg extension's 40 kg is not a leg press's 40 kg, so quoting it as this lift's last
+weight would be actively misleading. The substitute branch names what was done instead and
+declines to suggest a number.
 
 Pain words live in `PAIN_WORDS`. The pain branch is checked **before** any progression
 branch and must stay that way. `tests/test-flow.mjs` seeds a lateral raise that *both*
@@ -487,8 +509,10 @@ be set to look finished — see the table in `bot/README.md`.
       that the ring is visible on a notched screen with `viewport-fit=cover`, and that
       starting a rest timer while scrolled down doesn't jump the page (the readout is
       inserted at the top of the flow; browser scroll anchoring should absorb it).
-- [ ] **Lower B still has hip thrusts**, which he said he doesn't want. Needs a
-      replacement (back extension or a hamstring curl machine) — ask before swapping.
+- [ ] **Lower B still has hip thrusts** in the built-in default, which he said he doesn't
+      want. He can now remove it himself in the Program editor (§12) — but the *default*
+      still ships it, so every new user gets it. Decide whether to change `PROGRAM` itself;
+      ask before swapping, since the replacement affects the rating benchmark too.
 - [ ] Duration exercises (planks, rowing erg) are logged as seconds in the reps field.
       A dedicated duration input would be better.
 - [ ] Lateral raise mid-back pain — monitor; medical attention if it persists.
@@ -500,57 +524,93 @@ be set to look finished — see the table in `bot/README.md`.
 
 ---
 
-## 12. Next session — editable / custom exercises
+## 12. Editable program + substitution
 
-Agreed on 2026-08-12 as the next piece of work: **be able to change the exercises in a day
-and add your own.** Right now `PROGRAM` is a hard-coded `const` and the only escape hatch
-is "add custom exercise", which creates an unnamed entry that the rating engine ignores.
+Built 2026-08-14. Two separate actions, deliberately not one:
 
-This is not a UI job. Four things in the current design assume a fixed program, and each
-one has to be answered before writing code:
+| Action | Where | Scope | Rating effect |
+|---|---|---|---|
+| **Swap** | `SwapPanel`, on an exercise card in Log | **Today only.** Program unchanged. | Credited to the slot it replaced |
+| **Edit program** | `ProgramEditor`, Profile → Edit program | **Permanent**, every future session | Changes which slots exist at all |
 
-**1. Exercises are keyed by display name.** The coach does
-`lastSameDay.exercises.find((e) => e.name === pe.name)`, the charts group by name, and
-`EXERCISE_META` is a name-keyed object. **Rename a lift and its entire history detaches.**
-Editing almost certainly means giving exercises a stable `id` and treating the name as a
-label. That's a storage migration for any session already saved.
+They are different statements — "the leg press is busy today" versus "I don't do leg press
+any more" — so they are different screens. Don't merge them into one "edit" button.
 
-**2. `PROGRAM` has to move into CloudStorage.** A new key (`program_v1`) subject to the
-same 4096-char-per-value limit as everything else in §5 — the full 4-day split with links
-and targets will be close to that ceiling, so it probably needs splitting per day
-(`program_UpperA`…). Existing users need a fallback to the built-in default when the key
-is absent.
+### Exercise identity
 
-**3. The rating engine needs a benchmark for a lift it has never heard of.** `EXERCISE_META`
-gives each exercise a `multiplier` (how much it counts) and an `avg` (the "average person"
-benchmark for your bodyweight). A user-added lift has neither. Options, roughly in order of
-how well they fit what he's already asked for:
+**Exercises are identified by `id`, never by display name.** Matching on names meant renaming
+a lift silently detached its whole history from the coach, the charts and the rating.
 
-  - **Ask what it replaces**, and inherit that exercise's meta. Fits the actual use case —
-    the machine he wants is taken, so he swaps in a near-equivalent.
-  - **Pick a movement pattern** (horizontal push / vertical pull / squat / hinge /
-    isolation / core / conditioning) and derive a multiplier and a bodyweight-relative
-    `avg` from the pattern.
-  - **Track-only**: it logs but doesn't score. Simplest, and wrong for the main use case.
+- Built-in exercises: `id = slugId(original name)`, e.g. `dumbbell-bench-press`.
+- User-added: a random id (`x<random>`), **not** derived from the name — so renaming it later
+  can't orphan the history it has already collected.
 
-**4. The trap: §6 rule 3 says untouched exercises decay toward neutral, so skipping a lift
-slows the climb.** If a swapped-in exercise is treated as *new* rather than as a
-*substitution*, the lift it replaced reads as untouched and his rating quietly slows down
-**for doing the workout correctly**. Whatever design gets picked, a substitution must
-inherit the replaced exercise's coverage, not sit alongside it. This is the thing most
-likely to silently break, and it directly contradicts a rule he explicitly asked for.
+Sessions saved before ids existed are migrated **on read** by `normalizeSession`, which fills
+in `slugId(name)`. Because built-in ids are exactly that slug, old history reattaches itself
+with no storage rewrite — and nothing can half-fail. Same trick for `dayId`.
 
-**Decided 2026-08-13: both.** He substitutes for himself when a machine is taken
-(one session, doesn't change the split), *and* he wants friends to build their own programs
-from scratch (persistent). So this needs two distinct actions in the UI, not one blurred
-"edit" — a today-only swap and a permanent program change behave differently in the rating
-and should not be reachable from the same button.
+### Storage
 
-Implied by "friends build their own": the built-in 4-day split stops being *the* program
-and becomes the default for a new user. Everything in §7's coach and §6's rating that reads
-`PROGRAM` has to read the user's program instead.
+Split per day for the same reason sessions are (§5):
 
-### 12a. AI-generated programs — the blocker to solve first
+| Key | Contents |
+|---|---|
+| `prog_v1` | `{version, days: [{id, name, subtitle}]}` |
+| `prog_d_<dayId>` | that day's exercise array |
+
+`saveProgram` checks **every** day fits under 4000 chars before writing **any** of it, so an
+oversized day can't leave an index pointing at days that were never written. Deleted days'
+keys are removed *after* the index no longer references them, never before.
+
+Absent `prog_v1` means "never edited" and falls back to `DEFAULT_PROGRAM`, built from the
+`PROGRAM` constant. So changing that constant still changes what new users get.
+
+### Rating: slots, not names
+
+`computeEloTrajectory(sessions, bodyweight, program)`. **The denominator is the current
+program**, not everything ever logged:
+
+- Removing an exercise stops it dragging on your rating forever. Its past sessions are kept.
+- One-off exercises added during logging (`one-off-*` ids) don't create a slot, so they're
+  recorded but not scored. The Log tab says so out loud.
+- A substitution is credited to `slotIdOf(entry) = entry.substituteFor || entry.id`, so the
+  replaced lift does **not** read as untouched.
+
+A substitute is scored with **its own** benchmark but weighted by the **slot's** multiplier:
+you did a leg extension, so it's judged as one, but it filled the leg press's role today.
+
+### Where a user-added lift's benchmark comes from
+
+`MOVEMENT_PATTERNS` — the user picks the closest pattern and inherits its
+`multiplier`/`type`/`avg`. The swap panel **pre-selects the replaced lift's pattern**, since
+a substitute is nearly always the same movement; that's both the likely answer and the one
+least able to distort the rating if left alone. Same §6 honesty caveat, harder: these are
+rough family averages, not measurements of any specific lift, and the UI says so.
+
+`metaForEntry` lookup order, and each step matters:
+
+1. **the live program** — so editing an exercise's pattern re-contextualises its whole
+   history, the same way changing bodyweight does (§6);
+2. **`entry.meta` on the logged entry** — the only source for an off-program substitute, which
+   is why `substituteExercise` copies meta onto the entry for those and *deliberately not* for
+   program exercises;
+3. the built-in table, for exercises removed from the program but still in history;
+4. a neutral default.
+
+### The trap, and the test that guards it
+
+§6 rule 3: untouched exercises decay toward neutral, so skipping slows the climb. If a
+swapped-in lift were treated as *new* rather than as a substitution, the replaced lift would
+read as untouched and **the rating would drop for doing the workout correctly**.
+
+`tests/test-program.mjs` runs two identical histories differing only in whether the last
+session's bench press was done directly or substituted by an equal-benchmark lift, and
+asserts the ratings are **identical**. It also asserts the control: genuinely *skipping* the
+lift still costs something, so the substitution credit can't be quietly disabling the decay
+rule altogether. That test uses a deliberately small 3-exercise program — one lift out of the
+default 22 moves the rating by well under a point, which is correct behaviour but unmeasurable.
+
+### 12a. AI-generated programs — the next thing, and the blocker to solve first
 
 Raised 2026-08-13: friends describe what they want, an LLM generates a program. Fine idea.
 Two things have to be true before any of it gets written:
@@ -572,10 +632,12 @@ receives `initData` signed with the bot token, so the worker can verify with HMA
 caller is a real user of this bot, and rate-limit per user id. **Do not ship the proxy
 without this.** It's the difference between a $0.30/month bill and a drained account.
 
-Also worth settling before building: a generated program still needs `multiplier` and `avg`
-values per exercise for the rating to work at all (see point 3 above), so generation and the
-custom-exercise metadata problem are the same problem — solve that first, and generation
-becomes "fill in the same fields a human would have".
+**3. The metadata problem is already solved.** As of §12 a generated program just needs to
+fill in the same fields the editor does: `{id, name, muscle, target, rest, link, pattern}`,
+with `meta` derived from `pattern` via `metaFromPattern`. Constrain the model to the
+`MOVEMENT_PATTERNS` ids and the output drops straight into `saveProgram`. Validate it before
+saving — a pattern id that isn't in the list would silently fall back to a neutral default
+and quietly mis-score every session from then on.
 
 ---
 
@@ -607,3 +669,5 @@ becomes "fill in the same fields a human would have".
 | 2026-08-13 | **Export** added to the Profile tab (§8a): readable markdown for review, lossless JSON for backup, with a range selector. Closes the long-standing "no export/backup" item; restore is still missing. |
 | 2026-08-13 | **Bot answers `/start`** (§10a). `bot/` is a Cloudflare Worker webhook — the first and only server-side code in the project, and it never sees workout data. The bot looked broken because BotFather registers a bot but doesn't reply for it, and nothing was listening. |
 | 2026-08-13 | Corrected the Profile privacy notice, which still claimed the leaderboard published your name and rating to "anyone with this artifact's link". That stopped being true when the leaderboard became share/paste (§8). |
+| 2026-08-14 | **Editable program + today-only substitution** (§12). Exercises now have stable ids (old sessions migrate on read); the program lives in CloudStorage and `PROGRAM` becomes the default for new users; the rating denominator is the live program; a swap is credited to the slot it replaced. `MOVEMENT_PATTERNS` gives user-added lifts a benchmark. |
+| 2026-08-14 | Fixed while testing: the movement pattern chosen in the swap panel was being dropped, so every off-program substitute was scored against a neutral default instead of the benchmark the user picked. Substitute entries now carry their own `meta`. |

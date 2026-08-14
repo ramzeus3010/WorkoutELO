@@ -6,11 +6,12 @@
   "description": "Workout tracker as a Telegram Mini App",
   "scripts": {
     "build": "esbuild src/main.jsx --bundle --format=iife --outfile=dist/app.js --loader:.jsx=jsx --define:process.env.NODE_ENV='\"production\"' --minify",
-    "test": "npm run build && node tests/smoke.mjs && node tests/test-autosave.mjs && node tests/test-flow.mjs && node tests/test-export.mjs && node tests/test-bot.mjs",
+    "test": "npm run build && node tests/smoke.mjs && node tests/test-autosave.mjs && node tests/test-flow.mjs && node tests/test-export.mjs && node tests/test-program.mjs && node tests/test-bot.mjs",
     "test:smoke": "node tests/smoke.mjs",
     "test:autosave": "node tests/test-autosave.mjs",
     "test:flow": "node tests/test-flow.mjs",
     "test:export": "node tests/test-export.mjs",
+    "test:program": "node tests/test-program.mjs",
     "test:bot": "node tests/test-bot.mjs"
   },
   "dependencies": {

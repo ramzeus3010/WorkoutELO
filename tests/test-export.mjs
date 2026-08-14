@@ -69,7 +69,9 @@ check("markdown export reaches the clipboard", typeof clipboard === "string" && 
 const md = clipboard || "";
 
 check("recent session is included", md.includes(recent.date) && md.includes("Dumbbell Bench Press"));
-check("session outside the range is excluded", !md.includes("Leg Press"),
+// Assert on the session's own date and sets, not its exercise name — the export also lists
+// the current program, which legitimately contains a similarly named lift.
+check("session outside the range is excluded", !md.includes(old.date) && !md.includes("80kg×12"),
   "the 4-week range leaked a 60-day-old session");
 check("decimal weights survive", md.includes("22.5kg×10") && md.includes("7.5kg×14"));
 check("drop sets are marked, not flattened", md.includes("→ 15kg×6"));
@@ -96,7 +98,7 @@ click(w, buttonWithText(doc, "Everything"));
 await sleep(250);
 click(w, buttonWithText(doc, "Copy for review"));
 await sleep(300);
-check("Everything range includes the older session", (clipboard || "").includes("Leg Press"));
+check("Everything range includes the older session", (clipboard || "").includes(old.date) && (clipboard || "").includes("80kg×12"));
 
 await sleep(2100);
 
