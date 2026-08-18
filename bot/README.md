@@ -15,6 +15,34 @@ bot; it doesn't answer for it. Nothing was listening. That's all this fixes.
 Mini App inside Telegram. Same for `/app`. `/help` explains the tabs. Anything else gets a
 one-line nudge.
 
+Since the group leaderboard landed, it also does:
+
+| Command | Where | Does |
+|---|---|---|
+| `/register` | in a group | Turns that chat into a leaderboard and returns a 7-day join code |
+| `/score`, `/top` | group or DM | Current standings, recomputed live |
+
+…plus it posts automatically when someone finishes a workout, announces the winner every
+Monday, and nudges the group on Sunday evening.
+
+### The API the Mini App calls
+
+| Route | Does |
+|---|---|
+| `POST /api/join` | Redeems a join code, adds you to that group's board |
+| `POST /api/publish` | Records a finished session and announces it to the group |
+| `POST /api/me` | Your standing plus the current board |
+
+Every one of them requires a valid Telegram `initData` signature — identity comes from the
+signature, never from the request body, so claiming to be someone else gets nowhere. See
+`relay.js` and `tests/test-relay.mjs`, which tests forged and replayed payloads against real
+HMAC.
+
+**What is stored server-side:** display name, Telegram id, published scores, and a 60-day
+ledger of `{date, effort}` pairs. **Not** sets, reps, notes or programs — those never leave
+CloudStorage on each user's own account. If the KV store were wiped, every client could
+republish.
+
 ## Setup (~10 minutes, once)
 
 **1. Get the bot token.** In Telegram, [@BotFather](https://t.me/BotFather) →

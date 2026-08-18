@@ -8,6 +8,11 @@ const w = dom.window;
 const errs = [];
 w.console.error = (...a) => errs.push(a.join(" "));
 
+// A returning user, i.e. someone past onboarding. Without a bodyweight the app now opens on
+// the onboarding screen instead of the log — that path is covered by test-onboarding.mjs.
+w.localStorage.setItem("profile", JSON.stringify({ heightCm: 186, weightKg: 76, displayName: "Ramazan" }));
+w.localStorage.setItem("onboarded_v1", "1");
+
 w.eval(BUNDLE);
 await sleep(600);
 

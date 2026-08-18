@@ -150,7 +150,10 @@ const tiers = ["Bronze", "Silver", "Gold", "Platinum", "Diamond", "Top 5%"];
 
 check("progress tab shows a rating", /\b\d{3,4}\b/.test(progressText));
 check("a tier is assigned", tiers.some((t) => progressText.includes(t)), progressText.slice(0, 200));
-check("the layoff is reflected in the rating card", progressText.includes("gap since your last session"));
+// The layoff penalty was removed with the move to the ranked score: time off is already
+// visible on the weekly effort axis and in per-pattern decay, so deducting for it a third
+// time punished one absence three ways.
+check("no layoff penalty is charged any more", !progressText.includes("for the layoff"));
 check("dumbbell benchmarks stay caveated", /estimate/i.test(progressText));
 
 // ---- Leaderboard ----

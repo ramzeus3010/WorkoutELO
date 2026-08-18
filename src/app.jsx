@@ -2,6 +2,15 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from "react"
 import { createPortal } from "react-dom";
 import { Plus, X, Save, ChevronDown, ChevronUp, Trash2, TrendingUp, Dumbbell, History, LineChart as LineChartIcon, Loader2, Play, Pause, RotateCcw, SkipForward, ExternalLink, NotebookPen, Sparkles, ArrowDown, User, Award, Users, Share2, Check, Copy, FileText } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+// The cross-user scoring maths lives in its own module because the bot Worker needs the
+// identical implementation to answer /score with no client running — see src/scoring.js.
+// MOVEMENT_PATTERNS is imported rather than redeclared here so the two can never drift.
+import {
+  MOVEMENT_PATTERNS, patternById, strengthScore,
+  ACTIVITY_TYPES, activityEffort, activityTypeById,
+  sessionEffort, weeklyEffort, leagueTodayISO,
+  STRENGTH_BASELINE, STRENGTH_FLOOR, STRENGTH_HALF_LIFE_DAYS,
+} from "./scoring.js";
 
 // ---------- The built-in 4-day upper/lower split ----------
 // This is the DEFAULT a new user starts from, not the program itself — since §13 the live
@@ -128,25 +137,9 @@ Object.keys(EXERCISE_META).forEach((n) => { BUILTIN_META_BY_ID[slugId(n)] = EXER
 // Rather than inventing a number per exercise, the user picks the movement pattern and
 // inherits its multiplier/type/avg. Same honesty caveat as §6 applies, harder: these are
 // rough family averages, not measurements of any specific lift.
-const MOVEMENT_PATTERNS = [
-  { id: "push-horizontal", label: "Horizontal push", hint: "bench, chest press, dips", multiplier: 1.5, type: "weight", avg: 0.18 },
-  { id: "push-vertical", label: "Overhead push", hint: "shoulder press, OHP", multiplier: 1.5, type: "weight", avg: 0.12 },
-  { id: "pull-horizontal", label: "Row", hint: "any rowing movement", multiplier: 1.5, type: "weight", avg: 0.21 },
-  { id: "pull-vertical", label: "Pulldown / pull-up", hint: "lats", multiplier: 1.5, type: "weight", avg: 0.46 },
-  { id: "squat", label: "Squat / leg press", hint: "loaded knee bend", multiplier: 1.5, type: "weight", avg: 0.60 },
-  { id: "hinge", label: "Hinge", hint: "glutes and hamstrings", multiplier: 1.4, type: "weight", avg: 0.30 },
-  { id: "lunge", label: "Lunge / split squat", hint: "one leg at a time", multiplier: 1.3, type: "weight", avg: 0.15 },
-  { id: "isolation-upper", label: "Arm / shoulder isolation", hint: "curls, raises, extensions", multiplier: 0.75, type: "weight", avg: 0.10 },
-  { id: "isolation-lower", label: "Leg isolation", hint: "extensions, curls", multiplier: 0.8, type: "weight", avg: 0.40 },
-  { id: "calves", label: "Calves", hint: "counted in reps", multiplier: 0.55, type: "reps", avg: 20 },
-  { id: "bodyweight-reps", label: "Bodyweight reps", hint: "push-ups, back extensions", multiplier: 0.75, type: "reps", avg: 15 },
-  { id: "core", label: "Core hold", hint: "planks — logged in seconds", multiplier: 0.5, type: "duration", avg: 45 },
-  { id: "conditioning", label: "Conditioning", hint: "rowing, bike — logged in seconds", multiplier: 0.6, type: "duration", avg: 480 },
-];
-
-function patternById(id) {
-  return MOVEMENT_PATTERNS.find((p) => p.id === id) || null;
-}
+//
+// The table itself now lives in src/scoring.js (imported above) because the ranked slot set
+// is derived from it and the Worker needs both. Nothing else about how it's used has changed.
 
 // Best-guess pattern for a built-in exercise, so opening one in the editor shows something
 // sensible rather than an empty selector. Closest multiplier within the same measurement type.
@@ -193,6 +186,116 @@ const DEFAULT_PROGRAM = (() => {
   });
   return { version: 1, days, exercisesByDay };
 })();
+
+// ---------- Starting programs ----------
+// A new user used to land in Ramazan's 4-day split, hip thrusts and all. These are the
+// choices offered at onboarding instead; the old split is still here as one option among
+// several rather than as everyone's default.
+//
+// Built from movement patterns rather than named benchmarks, so every exercise scores
+// straight away. Deliberately no links or muscle strings — a template is a starting point
+// to edit, and half-filled metadata reads as more authoritative than it is.
+const TEMPLATE_EXERCISE = (name, pattern, target, rest) => ({ name, pattern, target, rest });
+
+const PROGRAM_TEMPLATES = [
+  {
+    id: "full-body-3",
+    name: "Full body, 3 days",
+    blurb: "The safest default if you're unsure. Every pattern, three times a week.",
+    days: [
+      { name: "Full A", exercises: [
+        TEMPLATE_EXERCISE("Bench / Chest Press", "push-horizontal", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Row", "pull-horizontal", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Squat / Leg Press", "squat", "3 x 8-12", 120),
+        TEMPLATE_EXERCISE("Plank", "core", "3 x 45s", 60),
+      ] },
+      { name: "Full B", exercises: [
+        TEMPLATE_EXERCISE("Overhead Press", "push-vertical", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Pulldown / Pull-Up", "pull-vertical", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Split Squat", "lunge", "3 x 10/leg", 90),
+        TEMPLATE_EXERCISE("Curl", "isolation-upper", "3 x 10-12", 60),
+      ] },
+      { name: "Full C", exercises: [
+        TEMPLATE_EXERCISE("Incline Press", "push-horizontal", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Row", "pull-horizontal", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Hip Hinge", "hinge", "3 x 8-12", 120),
+        TEMPLATE_EXERCISE("Calf Raise", "calves", "3 x 15-20", 45),
+      ] },
+    ],
+  },
+  {
+    id: "upper-lower-4",
+    name: "Upper / lower, 4 days",
+    blurb: "More volume per muscle. Legs are built into two of the four days on purpose.",
+    days: [
+      { name: "Upper A", exercises: [
+        TEMPLATE_EXERCISE("Bench / Chest Press", "push-horizontal", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Row", "pull-horizontal", "3 x 10-12", 90),
+        TEMPLATE_EXERCISE("Overhead Press", "push-vertical", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Curl", "isolation-upper", "2 x 10-12", 60),
+      ] },
+      { name: "Lower A", exercises: [
+        TEMPLATE_EXERCISE("Squat / Leg Press", "squat", "3 x 8-12", 120),
+        TEMPLATE_EXERCISE("Split Squat", "lunge", "3 x 10/leg", 90),
+        TEMPLATE_EXERCISE("Leg Extension", "isolation-lower", "3 x 12-15", 60),
+        TEMPLATE_EXERCISE("Plank", "core", "3 x 45s", 60),
+      ] },
+      { name: "Upper B", exercises: [
+        TEMPLATE_EXERCISE("Incline Press", "push-horizontal", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Pulldown / Pull-Up", "pull-vertical", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Lateral Raise", "isolation-upper", "3 x 12-15", 60),
+        TEMPLATE_EXERCISE("Triceps Extension", "isolation-upper", "2 x 10-12", 60),
+      ] },
+      { name: "Lower B", exercises: [
+        TEMPLATE_EXERCISE("Hip Hinge", "hinge", "3 x 8-12", 120),
+        TEMPLATE_EXERCISE("Walking Lunge", "lunge", "3 x 10/leg", 90),
+        TEMPLATE_EXERCISE("Calf Raise", "calves", "3 x 15-20", 45),
+        TEMPLATE_EXERCISE("Side Plank", "core", "3 x 30s", 45),
+      ] },
+    ],
+  },
+  {
+    id: "dumbbells-home",
+    name: "Dumbbells only, 3 days",
+    blurb: "No machines, no barbell. For training at home or a small building gym.",
+    days: [
+      { name: "Push", exercises: [
+        TEMPLATE_EXERCISE("Dumbbell Bench Press", "push-horizontal", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Dumbbell Overhead Press", "push-vertical", "3 x 8-12", 90),
+        TEMPLATE_EXERCISE("Lateral Raise", "isolation-upper", "3 x 12-15", 60),
+      ] },
+      { name: "Pull", exercises: [
+        TEMPLATE_EXERCISE("Single-Arm Row", "pull-horizontal", "3 x 10-12", 90),
+        TEMPLATE_EXERCISE("Dumbbell Curl", "isolation-upper", "3 x 10-12", 60),
+        TEMPLATE_EXERCISE("Back Extension", "bodyweight-reps", "3 x 12-15", 60),
+      ] },
+      { name: "Legs", exercises: [
+        TEMPLATE_EXERCISE("Goblet Squat", "squat", "3 x 8-12", 120),
+        TEMPLATE_EXERCISE("Split Squat", "lunge", "3 x 10/leg", 90),
+        TEMPLATE_EXERCISE("Calf Raise", "calves", "3 x 15-20", 45),
+        TEMPLATE_EXERCISE("Plank", "core", "3 x 45s", 60),
+      ] },
+    ],
+  },
+];
+
+function programFromTemplate(tpl) {
+  const days = tpl.days.map((d) => ({ id: slugId(d.name), name: d.name, subtitle: "" }));
+  const exercisesByDay = {};
+  tpl.days.forEach((d) => {
+    exercisesByDay[slugId(d.name)] = d.exercises.map((e) => ({
+      id: slugId(e.name),
+      name: e.name,
+      muscle: "",
+      target: e.target,
+      rest: e.rest,
+      link: "",
+      pattern: e.pattern,
+      meta: metaFromPattern(e.pattern),
+    }));
+  });
+  return withMetaIndex({ version: 1, days, exercisesByDay });
+}
 
 // Attaches an id -> meta index. Everything that needs an exercise's rating metadata goes
 // through this, so there is exactly one place that knows the lookup order.
@@ -296,6 +399,8 @@ const INDEX_KEY = "sess_index";
 function normalizeSession(s) {
   return {
     ...s,
+    // Everything logged before activities existed was a lifting session by definition.
+    kind: s.kind || "lift",
     dayId: s.dayId || slugId(s.day),
     exercises: (s.exercises || []).map((e) => ({ ...e, id: e.id || slugId(e.name) })),
   };
@@ -399,6 +504,55 @@ async function deleteSessionStored(id) {
   await cloud.set(INDEX_KEY, JSON.stringify(ids.filter((x) => x !== id)));
 }
 
+// ---------- The group relay ----------
+// The bot Worker. It receives a summary of a finished session — name, scores, exercise names —
+// and forwards it to the group chat. Workout data itself never goes here.
+//
+// Confirmed against the deployed worker 2026-08-18.
+const RELAY_URL = "https://chetamba-bot.chetamba.workers.dev";
+const GROUP_KEY = "group_v1";
+
+// Telegram signs initData with the bot token, so the Worker can prove who is calling without
+// any login. Outside Telegram there's nothing to send, and publishing is simply skipped.
+const initData = () => (TG && TG.initData) || "";
+
+async function relay(path, body) {
+  if (!initData()) return { ok: false, error: "not in telegram" };
+  try {
+    const res = await fetch(`${RELAY_URL}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...body, initData: initData() }),
+    });
+    return await res.json();
+  } catch (e) {
+    return { ok: false, error: "network" };
+  }
+}
+
+// Fire-and-forget by design. The session is already saved to CloudStorage by the time this
+// runs, so a failed publish must never surface as a failed workout — the worst case is the
+// group misses one message, and the next publish carries the updated totals anyway.
+function publishSession(session, profile, program, sessions) {
+  if (!initData()) return;
+  const asOf = leagueTodayISO();
+  const all = hydratePatterns([...sessions, session], program);
+  const strength = strengthScore(all, Number(profile.weightKg) || null, asOf).score;
+  const label = session.kind === "activity" ? activityTypeById(session.activityType).label : session.day;
+
+  relay("/api/publish", {
+    sessionId: session.id,
+    date: session.date,
+    kind: session.kind,
+    label,
+    minutes: session.minutes || null,
+    effort: sessionEffort(session),
+    strength,
+    name: profile.displayName || "",
+    exercises: (session.exercises || []).map((e) => e.name),
+  });
+}
+
 // ---------- Helpers ----------
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const fmtDate = (iso) => {
@@ -411,8 +565,14 @@ const fmtClock = (secs) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
 
-function emptyExerciseLog(name, muscle, rest, link) {
-  return { name, muscle: muscle || "", rest: rest || DEFAULT_REST, link: link || "", notes: "", sets: [] };
+// `pattern` decides how the entry is scored. It defaults rather than being left blank because
+// an unscored exercise is a silent hole in the rating — the user picks the right one on the
+// card, but a wrong-but-present default is far easier to notice and fix than a missing one.
+function emptyExerciseLog(name, muscle, rest, link, pattern) {
+  return {
+    name, muscle: muscle || "", rest: rest || DEFAULT_REST, link: link || "",
+    pattern: pattern || "isolation-upper", notes: "", sets: [],
+  };
 }
 
 // ---------- Sound (Web Audio beep, no external files) ----------
@@ -486,6 +646,7 @@ export default function App() {
   const [program, setProgram] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [onboarded, setOnboarded] = useState(true); // assume yes until storage says otherwise, so onboarding can't flash on reload
   const timer = useRestTimer();
 
   useEffect(() => {
@@ -496,6 +657,7 @@ export default function App() {
       } catch (e) { /* older Telegram clients */ }
     }
     (async () => {
+      setOnboarded((await cloud.get(ONBOARDED_KEY)) === "1");
       setProgram(await loadProgram());
       const loaded = await loadAllSessions();
       setSessions(loaded);
@@ -523,8 +685,12 @@ export default function App() {
     setSaving(true);
     setError("");
     const res = await saveSession(session);
-    if (res.ok) setSessions((prev) => [...(prev || []), session]);
-    else setError(res.reason);
+    if (res.ok) {
+      setSessions((prev) => [...(prev || []), session]);
+      // Only after the local write succeeded — the group should never be told about a
+      // workout the user's own device failed to keep.
+      publishSession(session, profile, program, sessions || []);
+    } else setError(res.reason);
     setSaving(false);
   }
 
@@ -554,6 +720,33 @@ export default function App() {
   }
 
   const loading = sessions === null || profile === null || program === null;
+
+  // Shown once, to someone who has never set a bodyweight. Skippable rather than a wall —
+  // people should be able to look around first, and a blocked first screen is a worse
+  // failure than a missing number we can nag about later.
+  const needsOnboarding = !loading && !profile.weightKg && !onboarded;
+
+  async function completeOnboarding({ profile: nextProfile, program: nextProgram }) {
+    setSaving(true);
+    await saveProfile(nextProfile);
+    if (nextProgram) await commitProgram(nextProgram);
+    await cloud.set(ONBOARDED_KEY, "1");
+    setOnboarded(true);
+    setSaving(false);
+  }
+
+  if (needsOnboarding) {
+    return (
+      <div className="min-h-screen bg-white text-gray-900 font-sans" style={{ colorScheme: "light" }}>
+        <div className="max-w-md mx-auto pb-12">
+          <Onboarding
+            initialName={profile.displayName || ""}
+            onDone={completeOnboarding}
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -603,6 +796,126 @@ export default function App() {
       </div>
       <RestRing timer={timer} />
       <BottomNav tab={tab} setTab={setTab} />
+    </div>
+  );
+}
+
+// ---------- Onboarding ----------
+// A friend opening a shared link used to land straight in someone else's 4-day split with no
+// bodyweight set — which silently means a dead score, because every load benchmark divides by
+// it (strengthScore returns baseline and nothing explains why).
+//
+// Bodyweight is therefore the one thing this insists on. The program is not: it can be picked
+// from a template, or skipped entirely, because under fixed pattern slots your program no
+// longer affects your score — it's a checklist, so getting it wrong costs nothing.
+const ONBOARDED_KEY = "onboarded_v1";
+
+function Onboarding({ initialName, onDone }) {
+  const [step, setStep] = useState(0);
+  const [name, setName] = useState(initialName || "");
+  const [weight, setWeight] = useState("");
+  const [height, setHeight] = useState("");
+
+  const weightNum = toNumber(weight);
+  const canContinue = weightNum > 0 && weightNum < 400;
+
+  function finishWith(program) {
+    onDone({
+      profile: { displayName: name.trim(), weightKg: weightNum, heightCm: toNumber(height) || "" },
+      program,
+    });
+  }
+
+  if (step === 0) {
+    return (
+      <div className="px-5 pt-8">
+        <h2 className="text-2xl font-bold tracking-tight mb-1">Welcome to Chetamba</h2>
+        <p className="text-sm text-gray-500 mb-6">Two things and you're in.</p>
+
+        <label className="block mb-4">
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Name on the leaderboard</span>
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Your name"
+            className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm"
+          />
+        </label>
+
+        <div className="flex gap-3 mb-2">
+          <label className="flex-1">
+            <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Bodyweight (kg)</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={weight}
+              onChange={(e) => setWeight(e.target.value)}
+              placeholder="76"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm"
+            />
+          </label>
+          <label className="flex-1">
+            <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Height (cm, optional)</span>
+            <input
+              type="text"
+              inputMode="numeric"
+              value={height}
+              onChange={(e) => setHeight(e.target.value)}
+              placeholder="186"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm"
+            />
+          </label>
+        </div>
+        <p className="text-xs text-gray-400 mb-6 leading-snug">
+          Your score is strength relative to your bodyweight, so it can't be worked out without
+          this. You can change it any time — it re-scores your whole history, not just what
+          comes after.
+        </p>
+
+        <button
+          onClick={() => setStep(1)}
+          disabled={!canContinue}
+          className={`w-full rounded-lg py-3 text-sm font-semibold ${
+            canContinue ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"
+          }`}
+        >
+          Continue
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-5 pt-8">
+      <h2 className="text-2xl font-bold tracking-tight mb-1">Pick a starting program</h2>
+      <p className="text-sm text-gray-500 mb-6">
+        Edit it later, or ignore it entirely — your program is a checklist, not what you're
+        scored against.
+      </p>
+
+      <div className="space-y-2.5 mb-5">
+        {PROGRAM_TEMPLATES.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => finishWith(programFromTemplate(t))}
+            className="w-full text-left rounded-xl border border-gray-200 bg-gray-50 px-4 py-3"
+          >
+            <p className="text-sm font-semibold">{t.name}</p>
+            <p className="text-xs text-gray-500 mt-0.5 leading-snug">{t.blurb}</p>
+          </button>
+        ))}
+      </div>
+
+      <button
+        onClick={() => finishWith(null)}
+        className="w-full rounded-lg border border-gray-300 py-3 text-sm font-semibold text-gray-600"
+      >
+        Skip — I'll log as I go
+      </button>
+      <p className="text-xs text-gray-400 mt-1.5 text-center leading-snug">
+        Uses the Ad-hoc day: add whatever you did, whenever you did it.
+      </p>
     </div>
   );
 }
@@ -895,77 +1208,43 @@ function tierForRating(rating) {
 // as a leg extension) but weighted by the SLOT's multiplier, because that's the role it
 // filled today.
 function computeEloTrajectory(sessions, bodyweightKg, program) {
-  const prog = program && program.days ? program : withMetaIndex(DEFAULT_PROGRAM);
-  const slots = programSlots(prog);
-  if (!bodyweightKg || !sessions || sessions.length === 0 || slots.length === 0) {
-    return { trajectory: [], rating: RATING_BASELINE, coverage: [] };
+  if (!bodyweightKg || !sessions || sessions.length === 0) {
+    return { trajectory: [], rating: STRENGTH_BASELINE, coverage: [] };
   }
-  const sorted = [...sessions].sort((a, b) => (a.date < b.date ? -1 : 1));
+  // Patterns are what the ranked slots are keyed on, and history predating pattern stamping
+  // has none — backfill before any of it is scored, or old sessions read as untrained.
+  const hydrated = hydratePatterns(sessions, program && program.days ? program : withMetaIndex(DEFAULT_PROGRAM));
+  const sorted = [...hydrated].sort((a, b) => (a.date < b.date ? -1 : 1));
 
-  const exState = {}; // slot id -> { lastP, lastDate, viaName }
-  let rating = RATING_BASELINE;
-  let prevDate = null;
-  const trajectory = [];
+  // The score at each past date is recomputed from the log as it stood that day. Slower than
+  // the old incremental replay, but it's a few dozen sessions and it buys order-independence:
+  // the same log always yields the same curve, which an Elo update loop could not promise.
+  const trajectory = sorted.map((session, i) => ({
+    date: session.date,
+    rating: strengthScore(sorted.slice(0, i + 1), bodyweightKg, session.date).score,
+    layoffPenalty: 0, // absence is shown on the weekly effort axis now, not punished twice
+    gapDays: i > 0 ? diffDaysBetween(session.date, sorted[i - 1].date) : 0,
+  }));
 
-  sorted.forEach((session, i) => {
-    // Layoff penalty: a long gap since your last logged session (any type) pulls the rating itself
-    // back toward baseline before this session's performance even counts. Short gaps (rest days,
-    // a missed exercise here and there) barely move it — this is specifically for real time off.
-    let layoffPenalty = 0;
-    if (prevDate) {
-      const gapDays = diffDaysBetween(session.date, prevDate);
-      const excess = gapDays - LAYOFF_GRACE_DAYS;
-      if (excess > 0) {
-        const decay = Math.pow(0.5, excess / LAYOFF_HALF_LIFE_DAYS);
-        const decayedRating = RATING_BASELINE + (rating - RATING_BASELINE) * decay;
-        layoffPenalty = Math.round(rating - decayedRating);
-        rating = decayedRating;
-      }
-    }
-
-    session.exercises.forEach((e) => {
-      const p = performanceIndex(e, bodyweightKg, metaForEntry(e, prog));
-      if (p !== null) {
-        exState[slotIdOf(e)] = { lastP: p, lastDate: session.date, viaName: e.substituteFor ? e.name : null };
-      }
-    });
-
-    let sumW = 0;
-    let sumWP = 0;
-    slots.forEach((slot) => {
-      const st = exState[slot.id];
-      let contribution;
-      if (!st) {
-        contribution = RATING_NEUTRAL;
-      } else {
-        const daysSince = diffDaysBetween(session.date, st.lastDate);
-        const decay = Math.pow(0.5, daysSince / RATING_HALF_LIFE_DAYS);
-        contribution = RATING_NEUTRAL + (st.lastP - RATING_NEUTRAL) * decay;
-      }
-      sumW += slot.meta.multiplier;
-      sumWP += slot.meta.multiplier * contribution;
-    });
-    const pRolling = sumWP / sumW;
-    const expected = expectedPFromRating(rating);
-    const K = i < 10 ? 32 : 16;
-    const actualClamped = Math.max(0.1, Math.min(2.5, pRolling));
-    rating = rating + K * (actualClamped - expected);
-    rating = Math.max(400, Math.min(2600, rating));
-    trajectory.push({ date: session.date, rating: Math.round(rating), pRolling, layoffPenalty, gapDays: prevDate ? diffDaysBetween(session.date, prevDate) : 0 });
-    prevDate = session.date;
-  });
-
-  // Coverage snapshot as of the latest session — which exercises are "fresh" vs decaying vs untouched.
   const latestDate = sorted[sorted.length - 1].date;
-  const coverage = slots.map((slot) => {
-    const st = exState[slot.id];
-    if (!st) return { id: slot.id, name: slot.name, status: "untouched", daysSince: null, viaName: null };
-    const daysSince = diffDaysBetween(latestDate, st.lastDate);
-    const status = daysSince <= 3 ? "fresh" : daysSince <= RATING_HALF_LIFE_DAYS ? "fading" : "stale";
-    return { id: slot.id, name: slot.name, status, daysSince, viaName: st.viaName };
-  });
+  const final = strengthScore(sorted, bodyweightKg, latestDate);
 
-  return { trajectory, rating: Math.round(rating), coverage };
+  // Per-pattern coverage, as of the latest session. This is also what the per-slot tiers in
+  // the Progress tab render from — twelve sub-goals rather than one number.
+  const coverage = final.slots.map((slot) => ({
+    id: slot.id,
+    name: slot.label,
+    status:
+      slot.daysSince === null ? "untouched"
+        : slot.daysSince <= 3 ? "fresh"
+        : slot.daysSince <= STRENGTH_HALF_LIFE_DAYS ? "fading"
+        : "stale",
+    daysSince: slot.daysSince,
+    rating: Math.round(STRENGTH_FLOOR + 800 * slot.contribution),
+    viaName: null,
+  }));
+
+  return { trajectory, rating: final.score, coverage };
 }
 
 function daysAgo(iso) {
@@ -1108,6 +1387,11 @@ const DRAFT_KEY = "draft_v1";
 
 // Turn a program exercise into a blank log entry. The id travels with it — that's what ties
 // the logged sets back to the right slot in the rating and the coach.
+// The movement pattern travels too. The cross-user score in scoring.js is computed per
+// PATTERN rather than per exercise, and it has to keep working for a session logged today
+// after the program is edited tomorrow — so the pattern is recorded on the entry at log
+// time rather than looked up later. Sessions logged before this existed are backfilled on
+// read by hydratePatterns().
 function logEntryFor(progEx) {
   return {
     id: progEx.id,
@@ -1116,9 +1400,141 @@ function logEntryFor(progEx) {
     rest: progEx.rest || DEFAULT_REST,
     link: progEx.link || "",
     target: progEx.target || "",
+    pattern: progEx.pattern || inferPatternId(progEx.meta),
     notes: "",
     sets: [],
   };
+}
+
+// Backfill `pattern` for history logged before entries carried one. Same lookup order as
+// metaForEntry: the live program wins (so re-classifying an exercise re-contextualises its
+// whole history), then metadata carried on the entry itself, then the built-in table.
+// Never mutates storage — a migration that rewrites every session can half-fail, and the
+// export is copy-only, so there'd be no way back.
+function hydratePatterns(sessions, program) {
+  const byId = {};
+  (program.days || []).forEach((d) => {
+    (program.exercisesByDay[d.id] || []).forEach((e) => {
+      if (e.pattern) byId[e.id] = e.pattern;
+    });
+  });
+  return (sessions || []).map((s) => ({
+    ...s,
+    exercises: (s.exercises || []).map((e) => ({
+      ...e,
+      pattern: byId[e.id] || e.pattern || inferPatternId(metaForEntry(e, program)),
+    })),
+  }));
+}
+
+// A blank day you build as you go. Not part of the program, so exercisesForDay returns []
+// for it and you add what you actually did. This is how "I went to the gym and improvised"
+// gets logged without editing your split — and since the ranked score is keyed on movement
+// patterns rather than program membership, improvised work scores exactly like planned work.
+const ADHOC_DAY = { id: "adhoc", name: "Ad-hoc", subtitle: "Anything you did today — add exercises as you go." };
+
+function ModeToggle({ mode, setMode }) {
+  return (
+    <div className="grid grid-cols-2 gap-1.5 mb-4">
+      {[{ id: "lift", label: "Lift" }, { id: "activity", label: "Activity" }].map((m) => (
+        <button
+          key={m.id}
+          onClick={() => setMode(m.id)}
+          className={`rounded-lg py-2 text-sm font-semibold transition-colors ${
+            mode === m.id ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-500"
+          }`}
+        >
+          {m.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Basketball, hikes, runs. Scored on the effort axis only: there is no load and no reps, so
+// there is nothing about a pickup game that can honestly be called strength. Duration curves
+// saturate rather than decline, so logging the true length is never worse than shading it —
+// see the note on ACTIVITY_TYPES in scoring.js.
+function ActivityLog({ onSave }) {
+  const [typeId, setTypeId] = useState(ACTIVITY_TYPES[0].id);
+  const [minutes, setMinutes] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [justSaved, setJustSaved] = useState(false);
+
+  const mins = toNumber(minutes);
+  const earned = mins > 0 ? activityEffort(typeId, mins) : 0;
+  const type = activityTypeById(typeId);
+
+  async function save() {
+    await onSave({ id: uid(), kind: "activity", date, activityType: typeId, minutes: mins, exercises: [] });
+    setMinutes("");
+    setJustSaved(true);
+    setTimeout(() => setJustSaved(false), 2000);
+  }
+
+  return (
+    <div>
+      <p className="text-xs text-gray-500 mb-3">
+        Counts toward showing up, not toward strength — there's no load to measure in a
+        pickup game.
+      </p>
+
+      <div className="grid grid-cols-2 gap-1.5 mb-4">
+        {ACTIVITY_TYPES.map((a) => (
+          <button
+            key={a.id}
+            onClick={() => setTypeId(a.id)}
+            className={`rounded-lg py-2 text-xs font-semibold leading-tight transition-colors ${
+              typeId === a.id ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-500"
+            }`}
+          >
+            {a.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex gap-3 mb-4">
+        <label className="flex-1">
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Date</span>
+          <input
+            type="date"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+          />
+        </label>
+        <label className="flex-1">
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Minutes</span>
+          {/* text + inputMode, never type="number" — see the iOS notes in the handover doc. */}
+          <input
+            type="text"
+            inputMode="numeric"
+            value={minutes}
+            onChange={(e) => setMinutes(e.target.value)}
+            placeholder={String(type.halfMin)}
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+          />
+        </label>
+      </div>
+
+      {mins > 0 && (
+        <p className="text-xs text-gray-500 mb-4">
+          Worth <span className="font-semibold text-maroon-600">{earned.toFixed(2)}</span> effort
+          this week{earned > type.ceiling * 0.9 ? " — near the most this activity can be worth, so extra time adds little." : "."}
+        </p>
+      )}
+
+      <button
+        onClick={save}
+        disabled={!(mins > 0)}
+        className={`w-full rounded-lg py-3 text-sm font-semibold ${
+          mins > 0 ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"
+        }`}
+      >
+        {justSaved ? "Saved" : "Record activity"}
+      </button>
+    </div>
+  );
 }
 
 function LogView({ onSave, timer, sessions, program }) {
@@ -1133,7 +1549,12 @@ function LogView({ onSave, timer, sessions, program }) {
   const [draftState, setDraftState] = useState("idle"); // idle | saving | saved
   const draftTimer = useRef(null);
 
-  const day = dayById(program, dayId) || days[0] || { id: "", name: "", subtitle: "" };
+  const [mode, setMode] = useState("lift"); // lift | activity
+  const selectableDays = [...days, ADHOC_DAY];
+  const day =
+    dayById(program, dayId) ||
+    (dayId === ADHOC_DAY.id ? ADHOC_DAY : null) ||
+    days[0] || { id: "", name: "", subtitle: "" };
 
   // Restore an in-progress workout on open, so closing the app mid-session never loses sets.
   useEffect(() => {
@@ -1229,6 +1650,7 @@ function LogView({ onSave, timer, sessions, program }) {
     setExercises((prev) => [...prev, { ...emptyExerciseLog("New exercise", "", DEFAULT_REST), id: "one-off-" + uid() }]);
   }
 
+
   function removeExercise(idx) {
     setExercises((prev) => prev.filter((_, i) => i !== idx));
   }
@@ -1239,6 +1661,7 @@ function LogView({ onSave, timer, sessions, program }) {
   async function handleSave() {
     const session = {
       id: uid(),
+      kind: "lift",
       date,
       day: day.name,
       dayId,
@@ -1254,14 +1677,25 @@ function LogView({ onSave, timer, sessions, program }) {
     setAnalysis(null);
   }
 
+  // Placed after every hook, so the early return can't change hook order between renders.
+  if (mode === "activity") {
+    return (
+      <div className="px-4 pt-4">
+        <ModeToggle mode={mode} setMode={setMode} />
+        <ActivityLog onSave={onSave} />
+      </div>
+    );
+  }
+
   return (
     <div className="px-4 pt-4">
+      <ModeToggle mode={mode} setMode={setMode} />
       <QuickTimer timer={timer} />
 
       {/* Day selector. Two columns once there are more than four days, because the program
           is user-editable now and a fixed 4-wide grid squeezes them unreadably thin. */}
-      <div className={`grid gap-1.5 mb-4 ${days.length > 4 ? "grid-cols-3" : "grid-cols-4"}`}>
-        {days.map((d) => (
+      <div className={`grid gap-1.5 mb-4 ${selectableDays.length > 4 ? "grid-cols-3" : "grid-cols-4"}`}>
+        {selectableDays.map((d) => (
           <button
             key={d.id}
             onClick={() => changeDay(d.id)}
@@ -1336,7 +1770,8 @@ function LogView({ onSave, timer, sessions, program }) {
         <Plus size={15} /> Add a one-off exercise
       </button>
       <p className="text-xs text-gray-400 mt-1.5 text-center leading-snug">
-        One-offs are logged but don't count toward your rating — only exercises in your program do.
+        One-offs count toward your rating like anything else — pick their movement pattern on the
+        card so it knows how to score them.
         To swap a lift for today, use <span className="font-semibold">Swap</span> on its card.
       </p>
 
@@ -1731,6 +2166,25 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
         </div>
       )}
 
+      {/* One-off exercises aren't in the program, so nothing else knows how to score them.
+          Program lifts get their pattern from the program and don't need this. */}
+      {String(exercise.id).startsWith("one-off-") && (
+        <div className="mx-3.5 mb-3">
+          <label className="block text-xs uppercase tracking-wider text-gray-500 mb-1">
+            Movement pattern — how this gets scored
+          </label>
+          <select
+            value={exercise.pattern || "isolation-upper"}
+            onChange={(e) => onChange({ ...exercise, pattern: e.target.value, meta: metaFromPattern(e.target.value) })}
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+          >
+            {MOVEMENT_PATTERNS.map((p) => (
+              <option key={p.id} value={p.id}>{p.label} — {p.hint}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
       {swapOpen && (
         <SwapPanel
           program={program}
@@ -1951,7 +2405,27 @@ function HistoryView({ sessions, onDelete }) {
     <div className="px-4 pt-4 space-y-2.5">
       {sorted.map((s) => {
         const open = openId === s.id;
-        const totalSets = s.exercises.reduce((sum, e) => sum + e.sets.length, 0);
+        const totalSets = (s.exercises || []).reduce((sum, e) => sum + e.sets.length, 0);
+
+        // An activity has no exercises or sets, so the lifting card would render it as an
+        // empty workout. It gets its own one-line row instead — there's nothing to expand.
+        if (s.kind === "activity") {
+          const at = activityTypeById(s.activityType);
+          return (
+            <div key={s.id} className="rounded-xl bg-gray-50 border border-gray-200 px-3.5 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm font-semibold">{at.label}</p>
+                <p className="text-xs text-gray-500">
+                  {fmtDate(s.date)} · {s.minutes} min · {activityEffort(s.activityType, s.minutes).toFixed(2)} effort
+                </p>
+              </div>
+              <button onClick={() => onDelete(s.id)} className="text-gray-400 p-1.5" aria-label="Delete activity">
+                <Trash2 size={15} />
+              </button>
+            </div>
+          );
+        }
+
         return (
           <div key={s.id} className="rounded-xl bg-gray-50 border border-gray-200 overflow-hidden">
             <button
@@ -2009,6 +2483,72 @@ function HistoryView({ sessions, onDelete }) {
 
 // ---------- Progress View ----------
 // ---------- Profile View ----------
+// Joining the group board. The code comes from /register in the group chat — a code rather
+// than a link because it has to survive being read off one phone and typed into another.
+function GroupJoin() {
+  const [code, setCode] = useState("");
+  const [state, setState] = useState({ status: "idle" }); // idle | working | joined | error
+  const [joined, setJoined] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      const stored = await cloud.get(GROUP_KEY);
+      if (stored) setJoined(stored);
+    })();
+  }, []);
+
+  async function submit() {
+    setState({ status: "working" });
+    const res = await relay("/api/join", { code: code.trim().toUpperCase() });
+    if (res && res.ok) {
+      await cloud.set(GROUP_KEY, res.groupTitle || "your group");
+      setJoined(res.groupTitle || "your group");
+      setState({ status: "joined" });
+      setCode("");
+    } else {
+      setState({ status: "error", message: (res && res.error) || "Couldn't join. Check the code and try again." });
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3.5 mb-4">
+      <p className="text-sm font-semibold mb-1">Group leaderboard</p>
+      {joined ? (
+        <p className="text-xs text-gray-500 leading-snug">
+          Posting to <span className="font-semibold">{joined}</span>. Finish a workout and the bot
+          announces it. Type <span className="font-mono">/score</span> in the chat for standings.
+        </p>
+      ) : (
+        <>
+          <p className="text-xs text-gray-500 mb-2.5 leading-snug">
+            Run <span className="font-mono">/register</span> in your group chat, then paste the code
+            here. Only your name and scores are shared — never your sets or notes.
+          </p>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder="ABC234"
+              className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm font-mono uppercase"
+            />
+            <button
+              onClick={submit}
+              disabled={code.trim().length < 4 || state.status === "working"}
+              className={`rounded-lg px-4 text-sm font-semibold ${
+                code.trim().length >= 4 ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"
+              }`}
+            >
+              {state.status === "working" ? "…" : "Join"}
+            </button>
+          </div>
+          {state.status === "error" && <p className="text-xs text-maroon-600 mt-1.5">{state.message}</p>}
+        </>
+      )}
+    </div>
+  );
+}
+
 function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
   const [heightCm, setHeightCm] = useState(profile.heightCm ?? "");
   const [weightKg, setWeightKg] = useState(profile.weightKg ?? "");
@@ -2108,6 +2648,8 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
           <Dumbbell size={15} /> Edit program
         </button>
       </div>
+
+      <GroupJoin />
 
       <ExportPanel sessions={sessions} profile={profile} program={program} />
 
@@ -2698,8 +3240,6 @@ function RatingCard({ eloResult, profile }) {
   const { tier, next } = tierForRating(rating);
   const prevRating = trajectory.length >= 2 ? trajectory[trajectory.length - 2].rating : RATING_BASELINE;
   const change = trajectory.length ? rating - prevRating : 0;
-  const lastEntry = trajectory[trajectory.length - 1];
-  const hadLayoff = lastEntry && lastEntry.layoffPenalty > 0;
 
   const rangeStart = tier.min;
   const rangeEnd = next ? next.min : tier.min + 400;
@@ -2728,13 +3268,9 @@ function RatingCard({ eloResult, profile }) {
         <p className="text-xs text-gray-400 mt-1">Log your first session to get your starting rating.</p>
       )}
 
-      {hadLayoff && (
-        <div className="mt-2 flex items-center gap-1.5 rounded-md bg-gray-700 px-2.5 py-1.5">
-          <p className="text-xs text-maroon-300">
-            {lastEntry.gapDays}-day gap since your last session — rating dropped {lastEntry.layoffPenalty} pts for the layoff, before this session even counted.
-          </p>
-        </div>
-      )}
+      {/* The layoff penalty is gone. Time off already shows up on the weekly effort axis,
+          publicly, and the per-pattern decay handles staleness — deducting a third time was
+          punishing one absence three ways. */}
 
       {next && trajectory.length > 0 && (
         <div className="mt-3">

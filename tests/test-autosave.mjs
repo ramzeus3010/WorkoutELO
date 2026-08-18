@@ -9,6 +9,9 @@ const dom1 = makeDom();
 const w1 = dom1.window;
 const errs1 = [];
 w1.console.error = (...a) => errs1.push(a.join(" "));
+// Past onboarding — otherwise the app opens on the welcome screen and there's no set to log.
+w1.localStorage.setItem("profile", JSON.stringify({ heightCm: 186, weightKg: 76, displayName: "Ramazan" }));
+w1.localStorage.setItem("onboarded_v1", "1");
 w1.eval(BUNDLE);
 await sleep(500);
 
@@ -51,6 +54,8 @@ check("no console errors while logging", errs1.length === 0, errs1.slice(0, 3).j
 // ---- Pass 2: fresh app instance sharing the same storage, expect restore ----
 const dom2 = makeDom();
 const w2 = dom2.window;
+w2.localStorage.setItem("profile", JSON.stringify({ heightCm: 186, weightKg: 76, displayName: "Ramazan" }));
+w2.localStorage.setItem("onboarded_v1", "1");
 w2.localStorage.setItem("draft_v1", draft); // simulates reopening the app
 const errs2 = [];
 w2.console.error = (...a) => errs2.push(a.join(" "));

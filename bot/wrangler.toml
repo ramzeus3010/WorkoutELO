@@ -7,6 +7,28 @@ compatibility_date = "2026-01-01"
 [vars]
 MINI_APP_URL = "https://ramzeus3010.github.io/WorkoutELO/dist/"
 DIRECT_LINK = "https://t.me/workoutelobot/chetamba"
+# Origin allowed to call /api/*. Not "*" — these endpoints accept writes.
+APP_ORIGIN = "https://ramzeus3010.github.io"
 
 # Optional: an https image URL to show as a card above the /start message.
 # PREVIEW_IMAGE_URL = "https://ramzeus3010.github.io/WorkoutELO/dist/preview.png"
+
+# The group leaderboard's only server-side state: display name, Telegram id, published
+# scores, and which group you belong to. NOT workout data — that stays in CloudStorage on
+# each user's own account. /score needs this because when someone types it in the group, no
+# client is running to ask.
+#
+# Store the INPUTS (session dates, best-per-pattern) rather than finished totals: weekly
+# effort decays, so a cached number goes stale and starts lying.
+[[kv_namespaces]]
+binding = "CHETAMBA"
+id = "dbeecc7987a94570be7662302771f88a"
+
+# Cron is UTC; the league runs on UTC+5 (Almaty). These are Monday 08:00 and Sunday 19:00
+# local. Keep in sync with MONDAY_CRON / SUNDAY_CRON in worker.js — runCron() matches on the
+# exact string, so a mismatch means the cron fires and does nothing.
+#
+# Cloudflare's day-of-week field is 1-7 (Mon-Sun), NOT the standard cron 0-6. "0" for Sunday
+# is rejected outright with "invalid cron string".
+[triggers]
+crons = ["0 3 * * 1", "0 14 * * 7"]
