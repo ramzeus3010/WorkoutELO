@@ -11,6 +11,12 @@ import {
   sessionEffort, weeklyEffort, leagueTodayISO,
   STRENGTH_BASELINE, STRENGTH_FLOOR, STRENGTH_HALF_LIFE_DAYS,
 } from "./scoring.js";
+// Strings, language detection and slugId — shared with the Worker for the same reason
+// scoring.js is: the bot posts standings into the group chat and must word them identically.
+import {
+  LANGS, DEFAULT_LANG, isLang, detectLang, slugId,
+  t, translator, plural, exerciseDisplayName, dayDisplayName,
+} from "./i18n.js";
 
 // ---------- The built-in 4-day upper/lower split ----------
 // This is the DEFAULT a new user starts from, not the program itself — since §13 the live
@@ -119,15 +125,10 @@ const TIERS = [
 // and matching on them meant renaming a lift silently detached its entire history from the
 // coach, the charts and the rating. Built-in exercises derive their id from their original
 // name, so sessions logged before ids existed migrate for free (see normalizeSession).
-function slugId(name) {
-  return (
-    String(name || "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 40) || "x"
-  );
-}
+//
+// slugId now lives in src/i18n.js. It used to strip everything outside [a-z0-9], which meant
+// every Cyrillic name collapsed to the single id "x" — see the comment on the function for
+// what that broke and why the ASCII path is preserved byte-for-byte.
 
 const BUILTIN_META_BY_ID = {};
 Object.keys(EXERCISE_META).forEach((n) => { BUILTIN_META_BY_ID[slugId(n)] = EXERCISE_META[n]; });
@@ -419,6 +420,10 @@ async function loadAllSessions() {
   return out;
 }
 
+// Storage failures return a translation KEY plus any values it needs, rather than finished
+// prose. These functions run below the React tree with no access to the language context, and
+// threading `lang` down into every one of them to build one rare error string was the worse
+// trade — App resolves them where it already has both.
 // ---------- Program storage ----------
 // Split the same way sessions are (§5): one key per day, because a single blob of four days
 // with links and targets would sit right on the 4096-char ceiling.
@@ -446,7 +451,7 @@ async function saveProgram(program) {
   for (const d of program.days) {
     const payload = JSON.stringify(program.exercisesByDay[d.id] || []);
     if (payload.length > 4000) {
-      return { ok: false, reason: `"${d.name}" has too much in it to store. Shorten some names or notes, or split it across two days.` };
+      return { ok: false, reason: "err.dayTooBig", reasonVars: { day: d.name } };
     }
   }
 
@@ -456,10 +461,10 @@ async function saveProgram(program) {
 
   for (const d of program.days) {
     const ok = await cloud.set(PROGRAM_DAY_PREFIX + d.id, JSON.stringify(program.exercisesByDay[d.id] || []));
-    if (!ok) return { ok: false, reason: "Storage write failed." };
+    if (!ok) return { ok: false, reason: "err.writeFailed" };
   }
   const ok = await cloud.set(PROGRAM_KEY, JSON.stringify({ version: 1, days: program.days }));
-  if (!ok) return { ok: false, reason: "Couldn't save the program index." };
+  if (!ok) return { ok: false, reason: "err.programIndex" };
 
   // Only now that the index no longer references them, drop deleted days' keys. Doing this
   // first would strand the data if the index write failed.
@@ -483,16 +488,16 @@ async function resetProgram() {
 async function saveSession(session) {
   const payload = JSON.stringify(session);
   if (payload.length > 4000) {
-    return { ok: false, reason: "This session is too large to store (too many sets/notes). Try shorter notes." };
+    return { ok: false, reason: "err.sessionTooBig" };
   }
   const ok = await cloud.set(SESSION_PREFIX + session.id, payload);
-  if (!ok) return { ok: false, reason: "Storage write failed." };
+  if (!ok) return { ok: false, reason: "err.writeFailed" };
   const raw = await cloud.get(INDEX_KEY);
   let ids = [];
   try { ids = raw ? JSON.parse(raw) : []; } catch (e) { ids = []; }
   if (!ids.includes(session.id)) ids.push(session.id);
   const idxOk = await cloud.set(INDEX_KEY, JSON.stringify(ids));
-  if (!idxOk) return { ok: false, reason: "Couldn't update the session index." };
+  if (!idxOk) return { ok: false, reason: "err.sessionIndex" };
   return { ok: true };
 }
 
@@ -533,31 +538,45 @@ async function relay(path, body) {
 // Fire-and-forget by design. The session is already saved to CloudStorage by the time this
 // runs, so a failed publish must never surface as a failed workout — the worst case is the
 // group misses one message, and the next publish carries the updated totals anyway.
-function publishSession(session, profile, program, sessions) {
+function publishSession(session, profile, program, sessions, lang) {
   if (!initData()) return;
   const asOf = leagueTodayISO();
   const all = hydratePatterns([...sessions, session], program);
   const strength = strengthScore(all, Number(profile.weightKg) || null, asOf).score;
-  const label = session.kind === "activity" ? activityTypeById(session.activityType).label : session.day;
+  // The label is what the group chat will read, so it goes out as a translation key rather
+  // than as finished text: the group's language is set at /register and may not be this
+  // user's. Custom day names have no key and travel as-is, which is correct — a name someone
+  // typed is not ours to translate.
+  const label = session.kind === "activity"
+    ? `act.${session.activityType}`
+    : `day.${session.dayId || slugId(session.day || "")}`;
 
   relay("/api/publish", {
     sessionId: session.id,
     date: session.date,
     kind: session.kind,
     label,
+    labelText: session.kind === "activity" ? "" : session.day || "",
     minutes: session.minutes || null,
     effort: sessionEffort(session),
     strength,
     name: profile.displayName || "",
+    // Keeps the bot's private messages in the language the app is set to, so someone who
+    // flips the switch doesn't keep getting English DMs.
+    lang: lang || DEFAULT_LANG,
     exercises: (session.exercises || []).map((e) => e.name),
   });
 }
 
 // ---------- Helpers ----------
 const todayISO = () => new Date().toISOString().slice(0, 10);
-const fmtDate = (iso) => {
+// Follows the app's language rather than the device locale. Someone on an English phone who
+// has chosen Russian should get "18 авг. 2026", not a date in a language they switched away
+// from — the switch is a statement about what they want to read.
+const DATE_LOCALES = { en: "en-GB", ru: "ru-RU" };
+const fmtDate = (iso, lang = DEFAULT_LANG) => {
   const d = new Date(iso + "T00:00:00");
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  return d.toLocaleDateString(DATE_LOCALES[lang] || DATE_LOCALES.en, { month: "short", day: "numeric", year: "numeric" });
 };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const fmtClock = (secs) => {
@@ -638,6 +657,45 @@ function useRestTimer() {
   return { state, remaining, start, pause, resume, addTime, dismiss };
 }
 
+// ---------- Language ----------
+// A context rather than a prop, because `lang` is needed in roughly forty components and
+// threading it through every one of them would touch more code than the translation itself.
+//
+// Stored under its own key, not inside the profile blob: the profile is what gets published
+// to the group relay, and language is a display preference rather than something the
+// leaderboard has any business knowing. Its own key also means resetting a profile doesn't
+// silently flip someone back to English.
+const LANG_KEY = "lang_v1";
+const LangContext = React.createContext(DEFAULT_LANG);
+
+/** The translator for the current language. `t("nav.log")` in any component. */
+function useT() {
+  const lang = React.useContext(LangContext);
+  return useMemo(() => translator(lang), [lang]);
+}
+
+/** The raw language id, for the handful of callers that need plurals or a display name. */
+function useLang() {
+  return React.useContext(LangContext);
+}
+
+/**
+ * Resolve what an exercise should be called on screen.
+ *
+ * Built-ins and template entries have an `ex.<id>` key and follow the switch; anything the
+ * user typed has no key and is shown exactly as they typed it. That asymmetry is the whole
+ * design — we translate our copy, never theirs.
+ */
+function useExerciseName() {
+  const lang = useLang();
+  return useCallback((ex) => exerciseDisplayName(lang, ex && ex.id, ex && ex.name), [lang]);
+}
+
+function useDayName() {
+  const lang = useLang();
+  return useCallback((d) => dayDisplayName(lang, d && d.id, d && d.name), [lang]);
+}
+
 // ---------- Main App ----------
 export default function App() {
   const [tab, setTab] = useState("log");
@@ -647,6 +705,9 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [onboarded, setOnboarded] = useState(true); // assume yes until storage says otherwise, so onboarding can't flash on reload
+  // Seeded synchronously from the Telegram account so the very first paint is already in the
+  // right language. Storage is read a moment later and wins if the user has ever chosen.
+  const [lang, setLang] = useState(() => detectLang(TG && TG.initDataUnsafe && TG.initDataUnsafe.user && TG.initDataUnsafe.user.language_code));
   const timer = useRestTimer();
 
   useEffect(() => {
@@ -657,6 +718,8 @@ export default function App() {
       } catch (e) { /* older Telegram clients */ }
     }
     (async () => {
+      const storedLang = await cloud.get(LANG_KEY);
+      if (isLang(storedLang)) setLang(storedLang);
       setOnboarded((await cloud.get(ONBOARDED_KEY)) === "1");
       setProgram(await loadProgram());
       const loaded = await loadAllSessions();
@@ -677,8 +740,17 @@ export default function App() {
     setError("");
     const ok = await cloud.set(PROFILE_KEY, JSON.stringify(next));
     if (ok) setProfile(next);
-    else setError("Couldn't save profile. Try again.");
+    else setError(t(lang, "err.profileSave"));
     setSaving(false);
+  }
+
+  // Applied to the UI immediately and persisted in the background: a language switch that
+  // waits on a network round-trip feels broken, and the worst case of a failed write is that
+  // the choice doesn't survive a reload.
+  function changeLang(next) {
+    if (!isLang(next)) return;
+    setLang(next);
+    cloud.set(LANG_KEY, next);
   }
 
   async function addSession(session) {
@@ -689,8 +761,8 @@ export default function App() {
       setSessions((prev) => [...(prev || []), session]);
       // Only after the local write succeeded — the group should never be told about a
       // workout the user's own device failed to keep.
-      publishSession(session, profile, program, sessions || []);
-    } else setError(res.reason);
+      publishSession(session, profile, program, sessions || [], lang);
+    } else setError(t(lang, res.reason, res.reasonVars));
     setSaving(false);
   }
 
@@ -707,7 +779,7 @@ export default function App() {
     const withIndex = withMetaIndex(next);
     const res = await saveProgram(withIndex);
     if (res.ok) setProgram(withIndex);
-    else setError(res.reason);
+    else setError(t(lang, res.reason, res.reasonVars));
     setSaving(false);
     return res;
   }
@@ -737,18 +809,23 @@ export default function App() {
 
   if (needsOnboarding) {
     return (
-      <div className="min-h-screen bg-white text-gray-900 font-sans" style={{ colorScheme: "light" }}>
-        <div className="max-w-md mx-auto pb-12">
-          <Onboarding
-            initialName={profile.displayName || ""}
-            onDone={completeOnboarding}
-          />
+      <LangContext.Provider value={lang}>
+        <div className="min-h-screen bg-white text-gray-900 font-sans" style={{ colorScheme: "light" }}>
+          <div className="max-w-md mx-auto pb-12">
+            <Onboarding
+              initialName={profile.displayName || ""}
+              onDone={completeOnboarding}
+              lang={lang}
+              onLang={changeLang}
+            />
+          </div>
         </div>
-      </div>
+      </LangContext.Provider>
     );
   }
 
   return (
+    <LangContext.Provider value={lang}>
     <div
       className="min-h-screen bg-white text-gray-900 font-sans"
       style={{ colorScheme: "light" }}
@@ -762,7 +839,7 @@ export default function App() {
         {loading ? (
           <div className="flex items-center justify-center gap-2 text-gray-500 py-24">
             <Loader2 className="animate-spin" size={18} />
-            <span className="text-sm">Loading log…</span>
+            <span className="text-sm">{t(lang, "app.loading")}</span>
           </div>
         ) : (
           <>
@@ -781,6 +858,8 @@ export default function App() {
                 sessions={sessions}
                 program={program}
                 onEditProgram={() => setTab("program")}
+                lang={lang}
+                onLang={changeLang}
               />
             )}
             {tab === "program" && (
@@ -797,6 +876,7 @@ export default function App() {
       <RestRing timer={timer} />
       <BottomNav tab={tab} setTab={setTab} />
     </div>
+    </LangContext.Provider>
   );
 }
 
@@ -810,7 +890,8 @@ export default function App() {
 // longer affects your score — it's a checklist, so getting it wrong costs nothing.
 const ONBOARDED_KEY = "onboarded_v1";
 
-function Onboarding({ initialName, onDone }) {
+function Onboarding({ initialName, onDone, lang, onLang }) {
+  const t = useT();
   const [step, setStep] = useState(0);
   const [name, setName] = useState(initialName || "");
   const [weight, setWeight] = useState("");
@@ -829,23 +910,28 @@ function Onboarding({ initialName, onDone }) {
   if (step === 0) {
     return (
       <div className="px-5 pt-8">
-        <h2 className="text-2xl font-bold tracking-tight mb-1">Welcome to Chetamba</h2>
-        <p className="text-sm text-gray-500 mb-6">Two things and you're in.</p>
+        {/* The language picker sits above the greeting, and is the only control on screen
+            that is deliberately shown in both languages at once — someone who landed in the
+            wrong one still has to be able to read their way out. */}
+        <LangToggle lang={lang} onLang={onLang} className="mb-5" />
+
+        <h2 className="text-2xl font-bold tracking-tight mb-1">{t("onb.welcome")}</h2>
+        <p className="text-sm text-gray-500 mb-6">{t("onb.sub")}</p>
 
         <label className="block mb-4">
-          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Name on the leaderboard</span>
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("onb.name")}</span>
           <input
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="Your name"
+            placeholder={t("onb.namePlaceholder")}
             className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm"
           />
         </label>
 
         <div className="flex gap-3 mb-2">
           <label className="flex-1">
-            <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Bodyweight (kg)</span>
+            <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("onb.weight")}</span>
             <input
               type="text"
               inputMode="decimal"
@@ -856,7 +942,7 @@ function Onboarding({ initialName, onDone }) {
             />
           </label>
           <label className="flex-1">
-            <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Height (cm, optional)</span>
+            <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("onb.height")}</span>
             <input
               type="text"
               inputMode="numeric"
@@ -867,11 +953,7 @@ function Onboarding({ initialName, onDone }) {
             />
           </label>
         </div>
-        <p className="text-xs text-gray-400 mb-6 leading-snug">
-          Your score is strength relative to your bodyweight, so it can't be worked out without
-          this. You can change it any time — it re-scores your whole history, not just what
-          comes after.
-        </p>
+        <p className="text-xs text-gray-400 mb-6 leading-snug">{t("onb.whyWeight")}</p>
 
         <button
           onClick={() => setStep(1)}
@@ -880,7 +962,7 @@ function Onboarding({ initialName, onDone }) {
             canContinue ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"
           }`}
         >
-          Continue
+          {t("onb.continue")}
         </button>
       </div>
     );
@@ -888,21 +970,18 @@ function Onboarding({ initialName, onDone }) {
 
   return (
     <div className="px-5 pt-8">
-      <h2 className="text-2xl font-bold tracking-tight mb-1">Pick a starting program</h2>
-      <p className="text-sm text-gray-500 mb-6">
-        Edit it later, or ignore it entirely — your program is a checklist, not what you're
-        scored against.
-      </p>
+      <h2 className="text-2xl font-bold tracking-tight mb-1">{t("onb.pickProgram")}</h2>
+      <p className="text-sm text-gray-500 mb-6">{t("onb.pickProgramSub")}</p>
 
       <div className="space-y-2.5 mb-5">
-        {PROGRAM_TEMPLATES.map((t) => (
+        {PROGRAM_TEMPLATES.map((tpl) => (
           <button
-            key={t.id}
-            onClick={() => finishWith(programFromTemplate(t))}
+            key={tpl.id}
+            onClick={() => finishWith(programFromTemplate(tpl))}
             className="w-full text-left rounded-xl border border-gray-200 bg-gray-50 px-4 py-3"
           >
-            <p className="text-sm font-semibold">{t.name}</p>
-            <p className="text-xs text-gray-500 mt-0.5 leading-snug">{t.blurb}</p>
+            <p className="text-sm font-semibold">{t(`tpl.${tpl.id}`)}</p>
+            <p className="text-xs text-gray-500 mt-0.5 leading-snug">{t(`tpl.${tpl.id}.blurb`)}</p>
           </button>
         ))}
       </div>
@@ -911,22 +990,47 @@ function Onboarding({ initialName, onDone }) {
         onClick={() => finishWith(null)}
         className="w-full rounded-lg border border-gray-300 py-3 text-sm font-semibold text-gray-600"
       >
-        Skip — I'll log as I go
+        {t("onb.skip")}
       </button>
-      <p className="text-xs text-gray-400 mt-1.5 text-center leading-snug">
-        Uses the Ad-hoc day: add whatever you did, whenever you did it.
-      </p>
+      <p className="text-xs text-gray-400 mt-1.5 text-center leading-snug">{t("onb.skipHint")}</p>
+    </div>
+  );
+}
+
+/**
+ * The language switch. Two buttons rather than a <select>, because a select on iOS opens a
+ * native wheel that renders its options in the system font and looked broken next to the
+ * rest of the form. Both labels are always shown in their own language — "Русский", not
+ * "Russian" — so it reads correctly whichever side you're currently stuck on.
+ */
+function LangToggle({ lang, onLang, className = "" }) {
+  return (
+    <div className={`inline-flex rounded-lg border border-gray-300 p-0.5 ${className}`}>
+      {LANGS.map((l) => (
+        <button
+          key={l.id}
+          onClick={() => onLang(l.id)}
+          aria-pressed={lang === l.id}
+          className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${
+            lang === l.id ? "bg-maroon-600 text-white" : "text-gray-600"
+          }`}
+        >
+          {l.label}
+        </button>
+      ))}
     </div>
   );
 }
 
 // ---------- Header ----------
 function Header({ saving }) {
+  const t = useT();
   return (
     <div className="px-5 pt-6 pb-4 border-b border-gray-200">
       <div className="flex items-baseline justify-between">
         <div>
-          <p className="text-xs tracking-widest uppercase text-maroon-600 font-semibold mb-1">Training Log</p>
+          <p className="text-xs tracking-widest uppercase text-maroon-600 font-semibold mb-1">{t("app.tagline")}</p>
+          {/* The product name is a proper noun and stays Latin in both languages. */}
           <h1 className="text-3xl font-bold tracking-tight">Chetamba</h1>
         </div>
         {saving && <Loader2 className="animate-spin text-gray-500" size={16} />}
@@ -937,11 +1041,16 @@ function Header({ saving }) {
 
 // ---------- Bottom Nav ----------
 function BottomNav({ tab, setTab }) {
+  const t = useT();
+  // Russian nav labels are longer than the English ones ("Прогресс" vs "Progress"). At the
+  // 18px base font four of them still fit across a narrow phone, but there is no room left —
+  // adding a fifth tab would wrap, which is a second reason the program editor lives inside
+  // Profile rather than beside it.
   const items = [
-    { id: "log", label: "Log", icon: Dumbbell },
-    { id: "history", label: "History", icon: History },
-    { id: "progress", label: "Progress", icon: LineChartIcon },
-    { id: "profile", label: "Profile", icon: User },
+    { id: "log", label: t("nav.log"), icon: Dumbbell },
+    { id: "history", label: t("nav.history"), icon: History },
+    { id: "progress", label: t("nav.progress"), icon: LineChartIcon },
+    { id: "profile", label: t("nav.profile"), icon: User },
   ];
   return (
     <div className="fixed bottom-0 inset-x-0 bg-white backdrop-blur border-t border-gray-200 shadow-sm">
@@ -1043,6 +1152,7 @@ function RestRing({ timer }) {
 // Sits in normal document flow at the very top of the page, so scrolling to the top of the
 // workout reveals it — it reads as the edge ring unrolling into a label.
 function RestReadout({ timer }) {
+  const t = useT();
   const { state, remaining, pause, resume, addTime, dismiss } = timer;
   if (!state) return null;
   const done = remaining <= 0;
@@ -1058,7 +1168,7 @@ function RestReadout({ timer }) {
           {done ? "0:00" : fmtClock(remaining)}
         </span>
         <div className="flex-1 min-w-0">
-          <p className="text-sm text-gray-500 truncate">{done ? "Rest done — go" : `Resting · ${state.label}`}</p>
+          <p className="text-sm text-gray-500 truncate">{done ? t("timer.done") : t("timer.resting", { label: state.label })}</p>
         </div>
         {!done && (
           <>
@@ -1081,6 +1191,7 @@ function RestReadout({ timer }) {
 // ---------- Log View ----------
 // ---------- Quick Timer (manual start/stop, always on the main screen) ----------
 function QuickTimer({ timer }) {
+  const t = useT();
   const { state, remaining, start, pause, resume, addTime, dismiss } = timer;
   const [customLen, setCustomLen] = useState(60);
   const presets = [30, 45, 60, 90, 120];
@@ -1091,7 +1202,7 @@ function QuickTimer({ timer }) {
     <div className="rounded-xl bg-gray-50 border border-gray-200 px-3.5 py-3 mb-4">
       {!active ? (
         <>
-          <p className="text-xs uppercase tracking-wider text-gray-400 mb-2">Quick Rest Timer</p>
+          <p className="text-xs uppercase tracking-wider text-gray-400 mb-2">{t("timer.quickTitle")}</p>
           <div className="flex items-center gap-1.5 flex-wrap">
             {presets.map((p) => (
               <button
@@ -1106,10 +1217,10 @@ function QuickTimer({ timer }) {
             ))}
           </div>
           <button
-            onClick={() => start(customLen, "Quick timer")}
+            onClick={() => start(customLen, t("timer.quick"))}
             className="w-full mt-2 flex items-center justify-center gap-1.5 bg-gray-900 text-white text-xs font-semibold rounded-md py-2.5"
           >
-            <Play size={13} /> Start
+            <Play size={13} /> {t("timer.start")}
           </button>
         </>
       ) : (
@@ -1118,7 +1229,7 @@ function QuickTimer({ timer }) {
             {done ? "0:00" : fmtClock(remaining)}
           </span>
           <div className="flex-1 min-w-0">
-            <p className="text-xs text-gray-500 truncate">{done ? "Rest done — go" : state.label}</p>
+            <p className="text-xs text-gray-500 truncate">{done ? t("timer.done") : state.label}</p>
           </div>
           {!done && (
             <>
@@ -1247,20 +1358,44 @@ function computeEloTrajectory(sessions, bodyweightKg, program) {
   return { trajectory, rating: final.score, coverage };
 }
 
-function daysAgo(iso) {
+function daysAgo(iso, lang = DEFAULT_LANG) {
   const d = new Date(iso + "T00:00:00");
   const diffMs = Date.now() - d.getTime();
   const days = Math.round(diffMs / 86400000);
-  if (days <= 0) return "today";
-  if (days === 1) return "1 day ago";
-  return `${days} days ago`;
+  if (days <= 0) return t(lang, "time.today");
+  return t(lang, "time.daysAgo", { n: days, unit: plural(lang, days, "unit.day") });
 }
 
 // ---------- Local rule-based coach (no API, works offline) ----------
 // Compares today's planned exercises against your most recent session of the same day,
 // plus overall recency for fatigue context. Deliberately conservative: anything that reads
 // like pain or discomfort in your notes produces a back-off suggestion, never a push.
-const PAIN_WORDS = ["pain", "hurt", "sharp", "tweak", "twinge", "sore", "strain", "pinch", "ache", "uncomfortable", "wrong", "clicked", "pop"];
+// Both languages are checked at once, regardless of the UI setting. Two reasons: the note
+// was typed in whatever language the user thinks in, which need not match the switch, and a
+// missed pain word is the single most costly failure in this file — it lets the next branch
+// suggest ADDING WEIGHT to a lift that hurt.
+//
+// The Russian entries are stems rather than whole words because Russian inflects: "бол"
+// catches боль / болит / больно / болел, which listing full forms would not. Stems overmatch
+// slightly and that is the correct direction to be wrong in — a false positive tells someone
+// to back off a lift that was fine, a false negative tells someone to load a lift that hurt.
+const PAIN_WORDS = [
+  // English
+  "pain", "hurt", "sharp", "tweak", "twinge", "sore", "strain", "pinch", "ache",
+  "uncomfortable", "wrong", "clicked", "pop",
+  // Russian — stems
+  "бол",        // боль, болит, больно, болел
+  "ноет", "ныл",
+  "прострел", "защемил", "защемл", "зажал",
+  "хрустн", "щёлкн", "щелкн", "хруст",
+  "тяне",       // тянет спину
+  "жжёт", "жжет",
+  "дискомфорт", "неприятн",
+  "остр",       // острая боль — does not match "осторожно"
+  "потянул", "надорвал", "сорвал",
+  "свело", "спазм", "судорог",
+  "воспал", "отёк", "отек", "травм", "неудобн",
+];
 
 function noteSignalsProblem(note) {
   if (!note) return false;
@@ -1274,13 +1409,16 @@ function repTargetCeiling(target) {
   return m ? Number(m[2]) : null;
 }
 
-function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall, program }) {
+function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall, program, lang = DEFAULT_LANG }) {
   const notes = [];
+  const tr = (key, vars) => t(lang, key, vars);
+  const nameOf = (ex) => exerciseDisplayName(lang, ex && ex.id, ex && ex.name);
 
   programExercises.forEach((pe) => {
     // Match on id, not name: renaming a lift must not orphan its history.
     const entries = (lastSameDay && lastSameDay.exercises) || [];
     const prev = entries.find((e) => e.id === pe.id && !e.substituteFor);
+    const name = nameOf(pe);
 
     if (!prev || !prev.sets || prev.sets.length === 0) {
       // If the slot was filled by a substitute last time, say so rather than claiming there's
@@ -1288,22 +1426,16 @@ function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall, prog
       // leg extension's 40kg is not a leg press's 40kg.
       const sub = entries.find((e) => e.substituteFor === pe.id && e.sets && e.sets.length);
       if (sub) {
-        notes.push({
-          id: pe.id,
-          name: pe.name,
-          note: `Last time you swapped in ${sub.name} here, so there's no recent number for this lift. Start from what you remember and stay conservative.`,
-        });
+        notes.push({ id: pe.id, name, note: tr("coach.swapped", { sub: nameOf(sub) }) });
         return;
       }
-      notes.push({ id: pe.id, name: pe.name, note: "No history yet — pick a weight you can control for all reps." });
+      notes.push({ id: pe.id, name, note: tr("coach.noHistory") });
       return;
     }
+    // Stays ahead of every suggestion below — a note that mentioned pain must never reach the
+    // "add weight" branch. tests/test-flow.mjs pins this ordering.
     if (noteSignalsProblem(prev.notes)) {
-      notes.push({
-        id: pe.id,
-        name: pe.name,
-        note: "Your last note flagged discomfort here — drop the weight, focus on form, and stop if it recurs.",
-      });
+      notes.push({ id: pe.id, name, note: tr("coach.pain") });
       return;
     }
     const meta = metaForEntry(pe, program);
@@ -1315,43 +1447,39 @@ function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall, prog
     if (meta.type === "duration" || meta.type === "reps") {
       notes.push({
         id: pe.id,
-        name: pe.name,
-        note: `Last time: ${topSet.reps}${meta.type === "duration" ? "s" : " reps"}. Aim to beat it by a little.`,
+        name,
+        note: tr("coach.beatIt", {
+          amount: meta.type === "duration"
+            ? tr("unit.secondsShort", { n: topSet.reps })
+            : `${topSet.reps} ${plural(lang, topSet.reps, "unit.rep")}`,
+        }),
       });
       return;
     }
     if (ceiling && lastSet.reps >= ceiling && !hadDrops) {
       const bump = topSet.weight >= 20 ? 2.5 : topSet.weight >= 10 ? 2 : 1;
-      notes.push({
-        id: pe.id,
-        name: pe.name,
-        note: `Hit the top of the range at ${topSet.weight}kg — try ${topSet.weight + bump}kg today.`,
-      });
+      notes.push({ id: pe.id, name, note: tr("coach.addWeight", { was: topSet.weight, next: topSet.weight + bump }) });
       return;
     }
     if (hadDrops) {
-      notes.push({
-        id: pe.id,
-        name: pe.name,
-        note: `You went to failure with drops at ${topSet.weight}kg — repeat that weight and aim for cleaner reps.`,
-      });
+      notes.push({ id: pe.id, name, note: tr("coach.drops", { weight: topSet.weight }) });
       return;
     }
-    notes.push({ id: pe.id, name: pe.name, note: `Stay at ${topSet.weight}kg and try to add a rep or two.` });
+    notes.push({ id: pe.id, name, note: tr("coach.addReps", { weight: topSet.weight }) });
   });
 
   let overall;
   if (!lastSameDay) {
-    overall = `First ${day} on record — log honestly today so the next one has something to build on.`;
+    overall = tr("coach.firstDay", { day });
   } else {
     const gap = diffDaysBetween(todayISO(), lastSameDay.date);
     const overallGap = lastOverall ? diffDaysBetween(todayISO(), lastOverall.date) : null;
     if (overallGap !== null && overallGap <= 1) {
-      overall = `You trained ${overallGap === 0 ? "today" : "yesterday"} already — if anything feels heavy, back off rather than grinding.`;
+      overall = tr("coach.trainedRecently", { when: tr(overallGap === 0 ? "time.today" : "time.yesterday") });
     } else if (gap > 21) {
-      overall = `It's been ${gap} days since your last ${day} — start lighter than you think and rebuild.`;
+      overall = tr("coach.longGap", { days: gap, unit: plural(lang, gap, "unit.day"), day });
     } else {
-      overall = `Last ${day} was ${gap} day${gap === 1 ? "" : "s"} ago. Beat it by a small margin, not a big one.`;
+      overall = tr("coach.recentGap", { day, days: gap, unit: plural(lang, gap, "unit.day") });
     }
   }
 
@@ -1360,13 +1488,14 @@ function buildLocalCoach({ day, programExercises, lastSameDay, lastOverall, prog
 
 // ---------- Coach Panel (pre-workout analysis) ----------
 function CoachPanel({ analysis, onStart }) {
+  const t = useT();
   if (analysis === null) {
     return (
       <button
         onClick={onStart}
         className="w-full mb-5 flex items-center justify-center gap-2 rounded-xl border border-dashed border-maroon-300 bg-maroon-50 text-maroon-700 text-sm font-semibold py-3"
       >
-        <Sparkles size={15} /> Start Workout — check last session
+        <Sparkles size={15} /> {t("coach.start")}
       </button>
     );
   }
@@ -1375,10 +1504,10 @@ function CoachPanel({ analysis, onStart }) {
     <div className="mb-5 rounded-xl bg-gray-900 text-white px-4 py-3.5">
       <div className="flex items-center gap-1.5 mb-1.5">
         <Sparkles size={13} className="text-maroon-400" />
-        <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">Coach</p>
+        <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">{t("coach.title")}</p>
       </div>
       <p className="text-sm leading-snug">{analysis.overall}</p>
-      <p className="text-xs text-gray-400 mt-2">Per-exercise notes below, on each exercise card.</p>
+      <p className="text-xs text-gray-400 mt-2">{t("coach.perExercise")}</p>
     </div>
   );
 }
@@ -1431,12 +1560,16 @@ function hydratePatterns(sessions, program) {
 // for it and you add what you actually did. This is how "I went to the gym and improvised"
 // gets logged without editing your split — and since the ranked score is keyed on movement
 // patterns rather than program membership, improvised work scores exactly like planned work.
-const ADHOC_DAY = { id: "adhoc", name: "Ad-hoc", subtitle: "Anything you did today — add exercises as you go." };
+// Name and subtitle are translation keys resolved at render, not literals: unlike a real
+// program day this one is ours, so it has to follow the language switch. `day.adhoc` also
+// exists in the dictionary so dayDisplayName() resolves it like any other built-in.
+const ADHOC_DAY = { id: "adhoc", name: "Ad-hoc", subtitle: "" };
 
 function ModeToggle({ mode, setMode }) {
+  const t = useT();
   return (
     <div className="grid grid-cols-2 gap-1.5 mb-4">
-      {[{ id: "lift", label: "Lift" }, { id: "activity", label: "Activity" }].map((m) => (
+      {[{ id: "lift", label: t("log.lift") }, { id: "activity", label: t("log.activity") }].map((m) => (
         <button
           key={m.id}
           onClick={() => setMode(m.id)}
@@ -1456,6 +1589,7 @@ function ModeToggle({ mode, setMode }) {
 // saturate rather than decline, so logging the true length is never worse than shading it —
 // see the note on ACTIVITY_TYPES in scoring.js.
 function ActivityLog({ onSave }) {
+  const t = useT();
   const [typeId, setTypeId] = useState(ACTIVITY_TYPES[0].id);
   const [minutes, setMinutes] = useState("");
   const [date, setDate] = useState(todayISO());
@@ -1474,10 +1608,7 @@ function ActivityLog({ onSave }) {
 
   return (
     <div>
-      <p className="text-xs text-gray-500 mb-3">
-        Counts toward showing up, not toward strength — there's no load to measure in a
-        pickup game.
-      </p>
+      <p className="text-xs text-gray-500 mb-3">{t("act.explain")}</p>
 
       <div className="grid grid-cols-2 gap-1.5 mb-4">
         {ACTIVITY_TYPES.map((a) => (
@@ -1488,14 +1619,14 @@ function ActivityLog({ onSave }) {
               typeId === a.id ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-500"
             }`}
           >
-            {a.label}
+            {t(`act.${a.id}`)}
           </button>
         ))}
       </div>
 
       <div className="flex gap-3 mb-4">
         <label className="flex-1">
-          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Date</span>
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("log.date")}</span>
           <input
             type="date"
             value={date}
@@ -1504,7 +1635,7 @@ function ActivityLog({ onSave }) {
           />
         </label>
         <label className="flex-1">
-          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Minutes</span>
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("act.minutes")}</span>
           {/* text + inputMode, never type="number" — see the iOS notes in the handover doc. */}
           <input
             type="text"
@@ -1519,8 +1650,9 @@ function ActivityLog({ onSave }) {
 
       {mins > 0 && (
         <p className="text-xs text-gray-500 mb-4">
-          Worth <span className="font-semibold text-maroon-600">{earned.toFixed(2)}</span> effort
-          this week{earned > type.ceiling * 0.9 ? " — near the most this activity can be worth, so extra time adds little." : "."}
+          {t("act.worth")}{" "}
+          <span className="font-semibold text-maroon-600">{earned.toFixed(2)}</span>{" "}
+          {earned > type.ceiling * 0.9 ? t("act.worthSuffixNearCap") : t("act.worthSuffix")}
         </p>
       )}
 
@@ -1531,13 +1663,16 @@ function ActivityLog({ onSave }) {
           mins > 0 ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"
         }`}
       >
-        {justSaved ? "Saved" : "Record activity"}
+        {justSaved ? t("log.saved") : t("act.record")}
       </button>
     </div>
   );
 }
 
 function LogView({ onSave, timer, sessions, program }) {
+  const t = useT();
+  const lang = useLang();
+  const dayName = useDayName();
   const days = program.days;
   const [dayId, setDayId] = useState(() => (days[0] ? days[0].id : ""));
   const [date, setDate] = useState(todayISO());
@@ -1608,11 +1743,14 @@ function LogView({ onSave, timer, sessions, program }) {
     const allSorted = [...(sessions || [])].sort((a, b) => (a.date < b.date ? 1 : -1));
     setAnalysis(
       buildLocalCoach({
-        day: day.name,
+        // The coach quotes the day back at you ("Last Upper A was 4 days ago"), so it needs
+        // the translated name rather than the stored one.
+        day: dayName(day),
         programExercises: exercisesForDay(program, dayId),
         lastSameDay: sameDaySessions[0] || null,
         lastOverall: allSorted[0] || null,
         program,
+        lang,
       })
     );
   }
@@ -1647,7 +1785,11 @@ function LogView({ onSave, timer, sessions, program }) {
   }
 
   function addCustomExercise() {
-    setExercises((prev) => [...prev, { ...emptyExerciseLog("New exercise", "", DEFAULT_REST), id: "one-off-" + uid() }]);
+    // The placeholder name is stored translated rather than as a key, because a one-off id
+    // is unique per tap and so can never have a dictionary entry. It's a starting value the
+    // user is expected to overwrite, so freezing it in the language it was created in is the
+    // same rule that applies to anything else they type.
+    setExercises((prev) => [...prev, { ...emptyExerciseLog(t("log.newExercise"), "", DEFAULT_REST), id: "one-off-" + uid() }]);
   }
 
 
@@ -1703,11 +1845,15 @@ function LogView({ onSave, timer, sessions, program }) {
               dayId === d.id ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-500"
             }`}
           >
-            {d.name}
+            {dayName(d)}
           </button>
         ))}
       </div>
-      {day.subtitle && <p className="text-xs text-gray-500 mb-4">{day.subtitle}</p>}
+      {/* The built-in days' subtitles come from the dictionary; a day the user created keeps
+          whatever subtitle they typed. Same rule as the names. */}
+      {(t(`day.${day.id}.subtitle`) !== `day.${day.id}.subtitle`
+        ? <p className="text-xs text-gray-500 mb-4">{t(`day.${day.id}.subtitle`)}</p>
+        : day.subtitle ? <p className="text-xs text-gray-500 mb-4">{day.subtitle}</p> : null)}
 
       {/* Coach: pre-workout analysis */}
       <CoachPanel analysis={analysis} onStart={handleStartWorkout} />
@@ -1715,7 +1861,7 @@ function LogView({ onSave, timer, sessions, program }) {
       {/* Date + duration */}
       <div className="flex gap-3 mb-5">
         <label className="flex-1">
-          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Date</span>
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("log.date")}</span>
           <input
             type="date"
             value={date}
@@ -1725,7 +1871,7 @@ function LogView({ onSave, timer, sessions, program }) {
           />
         </label>
         <label className="w-28">
-          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Minutes</span>
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("act.minutes")}</span>
           <input
             type="number"
             inputMode="numeric"
@@ -1767,13 +1913,12 @@ function LogView({ onSave, timer, sessions, program }) {
         onClick={addCustomExercise}
         className="w-full mt-3 flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-gray-200 text-gray-500 text-sm py-2.5 hover:border-gray-300 hover:text-gray-900 transition-colors"
       >
-        <Plus size={15} /> Add a one-off exercise
+        <Plus size={15} /> {t("log.addOneOff")}
       </button>
-      <p className="text-xs text-gray-400 mt-1.5 text-center leading-snug">
-        One-offs count toward your rating like anything else — pick their movement pattern on the
-        card so it knows how to score them.
-        To swap a lift for today, use <span className="font-semibold">Swap</span> on its card.
-      </p>
+      {/* This copy was wrong in the wild once — it still claimed one-offs "don't count toward
+          your rating" long after that rule was deleted. Re-read it whenever scoring changes;
+          tests/test-program.mjs pins the corrected sentence. */}
+      <p className="text-xs text-gray-400 mt-1.5 text-center leading-snug">{t("log.oneOffHint")}</p>
 
       <button
         onClick={handleSave}
@@ -1782,9 +1927,9 @@ function LogView({ onSave, timer, sessions, program }) {
           canSave ? "bg-maroon-600 text-white active:bg-maroon-700" : "bg-gray-100 text-gray-400"
         }`}
       >
-        {justSaved ? "Saved ✓" : (
+        {justSaved ? `${t("log.saved")} ✓` : (
           <>
-            <Save size={16} /> Save Workout
+            <Save size={16} /> {t("log.save")}
           </>
         )}
       </button>
@@ -1817,6 +1962,7 @@ function useKeyboardOffset() {
 }
 
 function KeyboardAccessory({ label, actionLabel, actionIcon, onAction, onDone, disabled }) {
+  const t = useT();
   const offset = useKeyboardOffset();
   if (typeof document === "undefined") return null;
 
@@ -1832,7 +1978,7 @@ function KeyboardAccessory({ label, actionLabel, actionIcon, onAction, onDone, d
           onClick={onDone}
           className="text-sm font-semibold text-gray-600 bg-white border border-gray-300 rounded-md px-3 py-2"
         >
-          Done
+          {t("kb.done")}
         </button>
         <button
           onMouseDown={(e) => e.preventDefault()}
@@ -1856,11 +2002,37 @@ function toNumber(v) {
   return Number.isFinite(n) ? n : NaN;
 }
 
+/**
+ * The movement-pattern dropdown, shared by Swap, the exercise card and the program editor.
+ * Factored out when it was translated: three copies of the same <option> list meant three
+ * places to forget, and the label+hint format is the kind of thing that drifts silently.
+ */
+function PatternSelect({ value, onChange, className }) {
+  const t = useT();
+  return (
+    <select
+      value={value || "isolation-upper"}
+      onChange={(e) => onChange(e.target.value)}
+      style={{ colorScheme: "light" }}
+      className={className}
+    >
+      {MOVEMENT_PATTERNS.map((p) => (
+        <option key={p.id} value={p.id}>
+          {t(`pat.${p.id}`)} — {t(`pat.${p.id}.hint`)}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 // ---------- Swap (today-only substitution) ----------
 // The machine you wanted is taken. Pick something else for today WITHOUT editing the program:
 // the work still counts toward the slot it replaced, so the rating doesn't read the original
 // as skipped. Editing the program itself is a different action, in the Program editor.
 function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel }) {
+  const t = useT();
+  const lang = useLang();
+  const exName = useExerciseName();
   const [mode, setMode] = useState("pick"); // pick | custom
   const [query, setQuery] = useState("");
   const [customName, setCustomName] = useState("");
@@ -1886,8 +2058,14 @@ function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel })
     [program, currentId, byId]
   );
 
+  // Matches the displayed name AND the stored one. Searching only the stored name meant a
+  // Russian user typing "жим" found nothing, because the underlying record still says
+  // "Dumbbell Bench Press"; searching only the displayed name would break the reverse case.
   const filtered = query.trim()
-    ? options.filter((e) => e.name.toLowerCase().includes(query.trim().toLowerCase()))
+    ? options.filter((e) => {
+        const q = query.trim().toLowerCase();
+        return exName(e).toLowerCase().includes(q) || String(e.name || "").toLowerCase().includes(q);
+      })
     : options;
 
   function pickCustom() {
@@ -1896,7 +2074,7 @@ function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel })
     onPick({
       id: "sub-" + slugId(name) + "-" + uid().slice(-4),
       name,
-      muscle: (patternById(customPattern) || {}).label || "",
+      muscle: t(`pat.${customPattern}`),
       target: "",
       rest: DEFAULT_REST,
       link: "",
@@ -1907,15 +2085,11 @@ function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel })
 
   return (
     <div className="mx-3.5 mb-3 rounded-md bg-white border border-gray-200 px-2.5 py-2.5">
-      <p className="text-xs text-gray-500 mb-2 leading-snug">
-        Swap this lift <span className="font-semibold">for today only</span>. Your program isn't
-        changed, and the work still counts toward this slot.
-      </p>
+      <p className="text-xs text-gray-500 mb-2 leading-snug">{t("swap.explain")}</p>
 
       {loggedSets > 0 && (
         <p className="text-xs text-maroon-700 mb-2 leading-snug">
-          The {loggedSets} set{loggedSets === 1 ? "" : "s"} already logged here belong to the current
-          exercise and will be cleared.
+          {t("swap.willClear", { n: loggedSets, unit: plural(lang, loggedSets, "unit.set") })}
         </p>
       )}
 
@@ -1924,13 +2098,13 @@ function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel })
           onClick={() => setMode("pick")}
           className={`flex-1 text-xs font-semibold rounded-md py-1.5 ${mode === "pick" ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-600"}`}
         >
-          From my program
+          {t("swap.fromProgram")}
         </button>
         <button
           onClick={() => setMode("custom")}
           className={`flex-1 text-xs font-semibold rounded-md py-1.5 ${mode === "custom" ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-600"}`}
         >
-          Something else
+          {t("swap.somethingElse")}
         </button>
       </div>
 
@@ -1939,20 +2113,20 @@ function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel })
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search your exercises…"
+            placeholder={t("swap.search")}
             className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
           <div className="max-h-56 overflow-y-auto space-y-1">
-            {filtered.length === 0 && <p className="text-xs text-gray-400 py-2">Nothing matches.</p>}
+            {filtered.length === 0 && <p className="text-xs text-gray-400 py-2">{t("swap.noMatch")}</p>}
             {filtered.map((e) => (
               <button
                 key={e.id}
                 onClick={() => onPick(e)}
                 className="w-full text-left rounded-md border border-gray-200 px-2.5 py-2 hover:bg-gray-50"
               >
-                <span className="block text-sm font-semibold truncate">{e.name}</span>
+                <span className="block text-sm font-semibold truncate">{exName(e)}</span>
                 {e.muscle && <span className="block text-xs text-gray-500 truncate">{e.muscle}</span>}
-                {e.id === slotId && <span className="block text-xs text-maroon-600">the original for this slot</span>}
+                {e.id === slotId && <span className="block text-xs text-maroon-600">{t("swap.original")}</span>}
               </button>
             ))}
           </div>
@@ -1962,41 +2136,31 @@ function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel })
           <input
             value={customName}
             onChange={(e) => setCustomName(e.target.value)}
-            placeholder="What are you doing instead?"
+            placeholder={t("swap.customPlaceholder")}
             className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
-          <p className="text-xs text-gray-500 mb-1 leading-snug">
-            Closest movement pattern — this is how it gets scored. Pre-set to match the lift
-            you're replacing; change it only if this is a genuinely different movement.
-          </p>
-          <select
-            value={customPattern}
-            onChange={(e) => setCustomPattern(e.target.value)}
-            style={{ colorScheme: "light" }}
-            className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
-          >
-            {MOVEMENT_PATTERNS.map((p) => (
-              <option key={p.id} value={p.id}>{p.label} — {p.hint}</option>
-            ))}
-          </select>
+          <p className="text-xs text-gray-500 mb-1 leading-snug">{t("swap.patternHint")}</p>
+          <PatternSelect value={customPattern} onChange={setCustomPattern} className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600" />
           <button
             onClick={pickCustom}
             disabled={!customName.trim()}
             className={`w-full text-sm font-semibold rounded-md py-2 ${customName.trim() ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"}`}
           >
-            Use this for today
+            {t("swap.useToday")}
           </button>
         </>
       )}
 
       <button onClick={onCancel} className="w-full mt-2 text-xs font-semibold text-gray-500 py-1.5">
-        Cancel
+        {t("common.cancel")}
       </button>
     </div>
   );
 }
 
 function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, onSubstitute, onRemove }) {
+  const t = useT();
+  const exName = useExerciseName();
   const [weight, setWeight] = useState("");
   const [reps, setReps] = useState("");
   const [expanded, setExpanded] = useState(true);
@@ -2041,7 +2205,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
     const set = { weight: weightNum, reps: repsNum };
     onChange({ ...exercise, sets: [...exercise.sets, set] });
     setReps("");
-    timer.start(restLen, exercise.name);
+    timer.start(restLen, exName(exercise));
   }
 
   function goToReps() {
@@ -2112,7 +2276,9 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
   const slotMatch = exercise.substituteFor && program
     ? programSlots(program).find((s) => s.id === exercise.substituteFor)
     : null;
-  const originalName = (slotMatch && slotMatch.name) || exercise.substituteForName || null;
+  const originalName = slotMatch
+    ? exName(slotMatch)
+    : exercise.substituteForName || null;
   // One-off additions aren't in the program, so there's no slot for them to stand in for.
   const canSwap = !!onSubstitute && !String(exercise.id || "").startsWith("one-off-");
 
@@ -2125,8 +2291,8 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
         >
           {expanded ? <ChevronUp size={15} className="text-gray-500 shrink-0" /> : <ChevronDown size={15} className="text-gray-500 shrink-0" />}
           <div className="min-w-0">
-            <p className="text-sm font-semibold truncate">{exercise.name}</p>
-            {exercise.muscle && <p className="text-xs text-gray-500 truncate">{exercise.muscle}{target ? ` · target ${target}` : ""}</p>}
+            <p className="text-sm font-semibold truncate">{exName(exercise)}</p>
+            {exercise.muscle && <p className="text-xs text-gray-500 truncate">{exercise.muscle}{target ? ` · ${t("log.target")} ${target}` : ""}</p>}
           </div>
         </button>
         {canSwap && (
@@ -2136,7 +2302,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
               swapOpen ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-600"
             }`}
           >
-            <RotateCcw size={11} /> Swap
+            <RotateCcw size={11} /> {t("log.swap")}
           </button>
         )}
         {exercise.link && (
@@ -2147,7 +2313,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
             onClick={(e) => e.stopPropagation()}
             className="flex items-center gap-1 text-xs font-semibold text-maroon-600 bg-maroon-50 rounded-md px-2 py-1.5 shrink-0 mr-1"
           >
-            <ExternalLink size={11} /> Form
+            <ExternalLink size={11} /> {t("log.form")}
           </a>
         )}
         <button onClick={onRemove} className="text-gray-500 hover:text-maroon-600 bg-gray-100 rounded-md p-1.5 shrink-0">
@@ -2161,7 +2327,9 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
         <div className="mx-3.5 mb-3 flex items-center gap-1.5 rounded-md bg-gray-100 border border-gray-200 px-2.5 py-2">
           <RotateCcw size={12} className="text-gray-500 shrink-0" />
           <p className="text-xs text-gray-600 leading-snug flex-1">
-            Standing in for <span className="font-semibold">{originalName || "another lift"}</span> today. It counts toward that slot.
+            {t("log.standingInFor")}{" "}
+            <span className="font-semibold">{originalName || t("log.anotherLift")}</span>{" "}
+            {t("log.countsToSlot")}
           </p>
         </div>
       )}
@@ -2171,17 +2339,13 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
       {String(exercise.id).startsWith("one-off-") && (
         <div className="mx-3.5 mb-3">
           <label className="block text-xs uppercase tracking-wider text-gray-500 mb-1">
-            Movement pattern — how this gets scored
+            {t("log.patternLabel")}
           </label>
-          <select
-            value={exercise.pattern || "isolation-upper"}
-            onChange={(e) => onChange({ ...exercise, pattern: e.target.value, meta: metaFromPattern(e.target.value) })}
+          <PatternSelect
+            value={exercise.pattern}
+            onChange={(next) => onChange({ ...exercise, pattern: next, meta: metaFromPattern(next) })}
             className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-          >
-            {MOVEMENT_PATTERNS.map((p) => (
-              <option key={p.id} value={p.id}>{p.label} — {p.hint}</option>
-            ))}
-          </select>
+          />
         </div>
       )}
 
@@ -2209,7 +2373,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
             <input
               value={exercise.name}
               onChange={(e) => renameExercise(e.target.value)}
-              placeholder="Exercise name"
+              placeholder={t("log.exerciseName")}
               className="w-full mb-2 bg-white rounded-md px-2.5 py-1.5 text-xs text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
             />
           )}
@@ -2219,24 +2383,24 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
               {exercise.sets.map((s, i) => (
                 <div key={i} className="bg-white rounded-md px-2.5 py-1.5">
                   <div className="flex items-center gap-1">
-                    <span className="text-xs text-gray-500 w-10 shrink-0">Set {i + 1}</span>
+                    <span className="text-xs text-gray-500 w-10 shrink-0">{t("log.setN", { n: i + 1 })}</span>
                     <span className="font-mono text-sm tabular-nums flex-1 text-center break-words">
-                      {s.weight}<span className="text-gray-500 text-xs">kg</span>×{s.reps}
+                      {s.weight}<span className="text-gray-500 text-xs">{t("unit.kg")}</span>×{s.reps}
                       {(s.drops || []).map((d, di) => (
                         <button
                           key={di}
                           onClick={() => removeDrop(i, di)}
                           className="text-maroon-600"
-                          title="Tap to remove this drop"
+                          title={t("log.removeDrop")}
                         >
-                          {" → "}{d.weight}<span className="text-gray-500 text-xs">kg</span>×{d.reps}
+                          {" → "}{d.weight}<span className="text-gray-500 text-xs">{t("unit.kg")}</span>×{d.reps}
                         </button>
                       ))}
                     </span>
                     <button
                       onClick={() => toggleDropForm(i)}
                       className={`flex items-center shrink-0 rounded-md p-1 ${dropFormFor === i ? "bg-maroon-100 text-maroon-600" : "bg-gray-100 text-gray-500"}`}
-                      title="Add a drop set"
+                      title={t("log.addDropSet")}
                     >
                       <ArrowDown size={11} />
                       <Plus size={9} className="-ml-0.5" />
@@ -2254,7 +2418,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
                         autoComplete="off"
                         value={dropWeight}
                         onChange={(e) => setDropWeight(e.target.value)}
-                        placeholder="kg"
+                        placeholder={t("unit.kg")}
                         className="w-16 bg-gray-50 rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
                       />
                       <span className="text-gray-400 text-sm">×</span>
@@ -2265,7 +2429,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
                         autoComplete="off"
                         value={dropReps}
                         onChange={(e) => setDropReps(e.target.value)}
-                        placeholder="reps"
+                        placeholder={t("log.repsShort")}
                         className="w-16 bg-gray-50 rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
                         onKeyDown={(e) => e.key === "Enter" && addDrop(i)}
                       />
@@ -2273,7 +2437,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
                         onClick={() => addDrop(i)}
                         className="flex-1 bg-maroon-50 text-maroon-600 text-xs font-semibold rounded-md py-1.5"
                       >
-                        Add drop
+                        {t("log.addDrop")}
                       </button>
                       <button onClick={() => setDropFormFor(null)} className="text-gray-400 shrink-0">
                         <X size={13} />
@@ -2287,12 +2451,12 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
 
           <div className="mb-2.5">
             <label className="flex items-center gap-1 text-xs uppercase tracking-wider text-gray-400 mb-1">
-              <NotebookPen size={11} /> Notes
+              <NotebookPen size={11} /> {t("log.notes")}
             </label>
             <textarea
               value={exercise.notes || ""}
               onChange={(e) => updateNotes(e.target.value)}
-              placeholder="e.g. seat height 4, felt it in shoulders not back…"
+              placeholder={t("log.notesPlaceholder")}
               rows={2}
               className="w-full resize-none bg-gray-50 rounded-md px-2.5 py-1.5 text-xs text-gray-900 placeholder-gray-400 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
             />
@@ -2313,7 +2477,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
               onChange={(e) => setWeight(e.target.value)}
               onFocus={(e) => handleFieldFocus("weight", e.target)}
               onBlur={handleFieldBlur}
-              placeholder="kg"
+              placeholder={t("unit.kg")}
               className="w-20 bg-white rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
             />
             <span className="self-center text-gray-400 text-sm">×</span>
@@ -2327,7 +2491,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
               onChange={(e) => setReps(e.target.value)}
               onFocus={(e) => handleFieldFocus("reps", e.target)}
               onBlur={handleFieldBlur}
-              placeholder="reps"
+              placeholder={t("log.repsShort")}
               className="w-20 bg-white rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
               onKeyDown={(e) => e.key === "Enter" && addSet()}
             />
@@ -2335,7 +2499,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
               onClick={addSet}
               className="flex-1 flex items-center justify-center gap-1 bg-gray-100 rounded-md text-sm font-semibold text-gray-900 hover:bg-gray-200 transition-colors"
             >
-              <Plus size={15} /> Add set + rest
+              <Plus size={15} /> {t("log.addSet")}
             </button>
           </div>
 
@@ -2343,8 +2507,8 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
               reaching for the screen between fields. */}
           {focusField && (
             <KeyboardAccessory
-              label={`${exercise.name} · ${focusField === "weight" ? "weight in kg" : "reps"}`}
-              actionLabel={focusField === "weight" ? "Next" : "Record the set"}
+              label={`${exName(exercise)} · ${focusField === "weight" ? t("log.weightInKg") : t("log.repsShort")}`}
+              actionLabel={focusField === "weight" ? t("log.next") : t("log.recordSet")}
               actionIcon={focusField === "weight" ? <SkipForward size={15} /> : <Check size={15} />}
               onAction={focusField === "weight" ? goToReps : recordFromKeyboard}
               onDone={() => {
@@ -2358,7 +2522,7 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
           )}
 
           <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="text-xs text-gray-400 mr-0.5">Rest timer:</span>
+            <span className="text-xs text-gray-400 mr-0.5">{t("log.restTimer")}</span>
             {restPresets.map((r) => (
               <button
                 key={r}
@@ -2372,10 +2536,10 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
             ))}
           </div>
           <button
-            onClick={() => timer.start(restLen, exercise.name)}
+            onClick={() => timer.start(restLen, exName(exercise))}
             className="w-full mt-1.5 flex items-center justify-center gap-1.5 bg-maroon-50 text-maroon-600 text-xs font-semibold rounded-md py-1.5"
           >
-            <RotateCcw size={12} /> Start rest timer now
+            <RotateCcw size={12} /> {t("log.startRestNow")}
           </button>
         </div>
       )}
@@ -2385,6 +2549,10 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
 
 // ---------- History View ----------
 function HistoryView({ sessions, onDelete }) {
+  const t = useT();
+  const lang = useLang();
+  const exName = useExerciseName();
+  const dayName = useDayName();
   const sorted = useMemo(
     () => [...sessions].sort((a, b) => (a.date < b.date ? 1 : -1)),
     [sessions]
@@ -2395,8 +2563,8 @@ function HistoryView({ sessions, onDelete }) {
     return (
       <div className="px-5 pt-16 text-center">
         <History size={28} className="mx-auto text-gray-400 mb-3" />
-        <p className="text-sm text-gray-500">No sessions logged yet.</p>
-        <p className="text-xs text-gray-400 mt-1">Log a workout and it'll show up here.</p>
+        <p className="text-sm text-gray-500">{t("hist.empty")}</p>
+        <p className="text-xs text-gray-400 mt-1">{t("hist.emptyHint")}</p>
       </div>
     );
   }
@@ -2414,12 +2582,12 @@ function HistoryView({ sessions, onDelete }) {
           return (
             <div key={s.id} className="rounded-xl bg-gray-50 border border-gray-200 px-3.5 py-3 flex items-center justify-between">
               <div>
-                <p className="text-sm font-semibold">{at.label}</p>
+                <p className="text-sm font-semibold">{t(`act.${at.id}`)}</p>
                 <p className="text-xs text-gray-500">
-                  {fmtDate(s.date)} · {s.minutes} min · {activityEffort(s.activityType, s.minutes).toFixed(2)} effort
+                  {fmtDate(s.date, lang)} · {t("hist.minutes", { n: s.minutes })} · {t("hist.effortValue", { n: activityEffort(s.activityType, s.minutes).toFixed(2) })}
                 </p>
               </div>
-              <button onClick={() => onDelete(s.id)} className="text-gray-400 p-1.5" aria-label="Delete activity">
+              <button onClick={() => onDelete(s.id)} className="text-gray-400 p-1.5" aria-label={t("hist.deleteActivity")}>
                 <Trash2 size={15} />
               </button>
             </div>
@@ -2433,10 +2601,12 @@ function HistoryView({ sessions, onDelete }) {
               className="w-full flex items-center justify-between px-3.5 py-3 text-left"
             >
               <div>
-                <p className="text-sm font-semibold">{s.day}</p>
+                {/* Sessions store the day name as it was at log time; dayName() re-resolves
+                    built-ins through the dictionary so old records follow the switch too. */}
+                <p className="text-sm font-semibold">{dayName({ id: s.dayId || slugId(s.day || ""), name: s.day })}</p>
                 <p className="text-xs text-gray-500">
-                  {fmtDate(s.date)} · {s.exercises.length} exercises · {totalSets} sets
-                  {s.duration ? ` · ${s.duration} min` : ""}
+                  {fmtDate(s.date, lang)} · {t("hist.exerciseCount", { n: s.exercises.length, unit: plural(lang, s.exercises.length, "unit.exercise") })} · {t("hist.setCount", { n: totalSets, unit: plural(lang, totalSets, "unit.set") })}
+                  {s.duration ? ` · ${t("hist.minutes", { n: s.duration })}` : ""}
                 </p>
               </div>
               {open ? <ChevronUp size={15} className="text-gray-500" /> : <ChevronDown size={15} className="text-gray-500" />}
@@ -2446,7 +2616,7 @@ function HistoryView({ sessions, onDelete }) {
                 {s.exercises.map((e, i) => (
                   <div key={i}>
                     <div className="flex items-center gap-2 mb-1">
-                      <p className="text-xs font-semibold text-gray-900">{e.name}</p>
+                      <p className="text-xs font-semibold text-gray-900">{exName(e)}</p>
                       {e.link && (
                         <a href={e.link} target="_blank" rel="noopener noreferrer" className="text-maroon-600">
                           <ExternalLink size={11} />
@@ -2456,9 +2626,9 @@ function HistoryView({ sessions, onDelete }) {
                     <div className="flex flex-wrap gap-1.5">
                       {e.sets.map((set, si) => (
                         <span key={si} className="font-mono text-xs tabular-nums bg-white rounded px-2 py-1 text-gray-700">
-                          {set.weight}kg×{set.reps}
+                          {set.weight}{t("unit.kg")}×{set.reps}
                           {(set.drops || []).map((d, di) => (
-                            <span key={di} className="text-maroon-600">{" → "}{d.weight}kg×{d.reps}</span>
+                            <span key={di} className="text-maroon-600">{" → "}{d.weight}{t("unit.kg")}×{d.reps}</span>
                           ))}
                         </span>
                       ))}
@@ -2470,7 +2640,7 @@ function HistoryView({ sessions, onDelete }) {
                   onClick={() => onDelete(s.id)}
                   className="mt-1 flex items-center gap-1.5 text-xs text-gray-500 hover:text-maroon-600"
                 >
-                  <Trash2 size={12} /> Delete session
+                  <Trash2 size={12} /> {t("hist.deleteSession")}
                 </button>
               </div>
             )}
@@ -2486,6 +2656,7 @@ function HistoryView({ sessions, onDelete }) {
 // Joining the group board. The code comes from /register in the group chat — a code rather
 // than a link because it has to survive being read off one phone and typed into another.
 function GroupJoin() {
+  const t = useT();
   const [code, setCode] = useState("");
   const [state, setState] = useState({ status: "idle" }); // idle | working | joined | error
   const [joined, setJoined] = useState(null);
@@ -2501,28 +2672,30 @@ function GroupJoin() {
     setState({ status: "working" });
     const res = await relay("/api/join", { code: code.trim().toUpperCase() });
     if (res && res.ok) {
-      await cloud.set(GROUP_KEY, res.groupTitle || "your group");
-      setJoined(res.groupTitle || "your group");
+      const title = res.groupTitle || t("group.yourGroup");
+      await cloud.set(GROUP_KEY, title);
+      setJoined(title);
       setState({ status: "joined" });
       setCode("");
     } else {
-      setState({ status: "error", message: (res && res.error) || "Couldn't join. Check the code and try again." });
+      // The Worker's error strings are already localised to this user's language — it knows
+      // it from the initData we sent — so they're shown as-is rather than re-translated here.
+      setState({ status: "error", message: (res && res.error) || t("group.joinFailed") });
     }
   }
 
   return (
     <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3.5 mb-4">
-      <p className="text-sm font-semibold mb-1">Group leaderboard</p>
+      <p className="text-sm font-semibold mb-1">{t("group.title")}</p>
       {joined ? (
         <p className="text-xs text-gray-500 leading-snug">
-          Posting to <span className="font-semibold">{joined}</span>. Finish a workout and the bot
-          announces it. Type <span className="font-mono">/score</span> in the chat for standings.
+          {t("group.postingTo")} <span className="font-semibold">{joined}</span>. {t("group.postingHint")}{" "}
+          <span className="font-mono">/score</span> {t("group.postingHint2")}
         </p>
       ) : (
         <>
           <p className="text-xs text-gray-500 mb-2.5 leading-snug">
-            Run <span className="font-mono">/register</span> in your group chat, then paste the code
-            here. Only your name and scores are shared — never your sets or notes.
+            {t("group.runRegister1")} <span className="font-mono">/register</span> {t("group.runRegister2")}
           </p>
           <div className="flex gap-2">
             <input
@@ -2539,7 +2712,7 @@ function GroupJoin() {
                 code.trim().length >= 4 ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"
               }`}
             >
-              {state.status === "working" ? "…" : "Join"}
+              {state.status === "working" ? "…" : t("group.join")}
             </button>
           </div>
           {state.status === "error" && <p className="text-xs text-maroon-600 mt-1.5">{state.message}</p>}
@@ -2549,7 +2722,8 @@ function GroupJoin() {
   );
 }
 
-function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
+function ProfileView({ profile, onSave, sessions, program, onEditProgram, lang, onLang }) {
+  const t = useT();
   const [heightCm, setHeightCm] = useState(profile.heightCm ?? "");
   const [weightKg, setWeightKg] = useState(profile.weightKg ?? "");
   const [displayName, setDisplayName] = useState(profile.displayName ?? "");
@@ -2574,13 +2748,18 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
 
   return (
     <div className="px-4 pt-4">
-      <p className="text-xs text-gray-500 mb-4">
-        Your rating on the Progress tab is calculated relative to your current bodyweight. Update this anytime you cut, bulk, or just want your numbers re-contextualized — your whole rating history recalculates against the new figure, not just future sessions.
-      </p>
+      {/* Language sits at the top of Profile, above the bodyweight copy — someone who opened
+          the app in the wrong language needs to find this without reading anything first. */}
+      <div className="flex items-center justify-between mb-4">
+        <span className="text-xs uppercase tracking-wider text-gray-500 font-semibold">{t("prof.language")}</span>
+        <LangToggle lang={lang} onLang={onLang} />
+      </div>
+
+      <p className="text-xs text-gray-500 mb-4">{t("prof.weightExplain")}</p>
 
       <div className="rounded-xl bg-gray-50 border border-gray-200 p-4 space-y-4">
         <label className="block">
-          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Height (cm)</span>
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("prof.height")}</span>
           <input
             type="number"
             inputMode="numeric"
@@ -2591,7 +2770,7 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
           />
         </label>
         <label className="block">
-          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">Weight (kg)</span>
+          <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1">{t("prof.weight")}</span>
           {/* text/decimal, not number — see the set-entry inputs: iOS renders a dead
               decimal point on number inputs, so 76.5 kg would be unenterable. */}
           <input
@@ -2606,13 +2785,13 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
         </label>
         <label className="block">
           <span className="block text-xs uppercase tracking-wider text-gray-500 mb-1 flex items-center gap-1">
-            <Users size={11} /> Display name (for the leaderboard)
+            <Users size={11} /> {t("prof.displayName")}
           </span>
           <input
             type="text"
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
-            placeholder="e.g. Ramazan"
+            placeholder={t("prof.displayNamePlaceholder")}
             maxLength={24}
             className="w-full bg-white rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
           />
@@ -2624,9 +2803,9 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
             dirty ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-400"
           }`}
         >
-          {justSaved ? "Saved ✓" : (
+          {justSaved ? `${t("log.saved")} ✓` : (
             <>
-              <Save size={16} /> Save Profile
+              <Save size={16} /> {t("prof.save")}
             </>
           )}
         </button>
@@ -2635,17 +2814,21 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
       <div className="mt-5 rounded-xl bg-gray-50 border border-gray-200 px-4 py-3.5">
         <div className="flex items-center gap-1.5 mb-2">
           <Dumbbell size={14} className="text-maroon-600" />
-          <p className="text-sm uppercase tracking-wider text-gray-500 font-semibold">Program</p>
+          <p className="text-sm uppercase tracking-wider text-gray-500 font-semibold">{t("prof.program")}</p>
         </div>
         <p className="text-sm text-gray-500 mb-3 leading-snug">
-          {program.days.length} day{program.days.length === 1 ? "" : "s"}, {programSlots(program).length} exercises.
-          Add your own lifts, change the days, or start from scratch.
+          {t("prof.programSummary", {
+            days: program.days.length,
+            dayUnit: plural(lang, program.days.length, "unit.dayCount"),
+            exercises: programSlots(program).length,
+            exerciseUnit: plural(lang, programSlots(program).length, "unit.exercise"),
+          })}
         </p>
         <button
           onClick={onEditProgram}
           className="w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold bg-maroon-600 text-white"
         >
-          <Dumbbell size={15} /> Edit program
+          <Dumbbell size={15} /> {t("prof.editProgram")}
         </button>
       </div>
 
@@ -2654,12 +2837,7 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
       <ExportPanel sessions={sessions} profile={profile} program={program} />
 
       <div className="mt-5 rounded-xl bg-maroon-50 border border-maroon-100 px-4 py-3">
-        <p className="text-sm text-maroon-800 leading-snug">
-          Everything here stays on your own Telegram account — nothing is uploaded and there is no
-          server. Your display name and rating only leave this device if you tap "Share my score" on
-          the Progress tab, which puts a single line into a chat you choose. Your sets, notes and
-          bodyweight are never in that line.
-        </p>
+        <p className="text-sm text-maroon-800 leading-snug">{t("prof.privacy")}</p>
       </div>
     </div>
   );
@@ -2674,6 +2852,9 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram }) {
 // Edits are held locally and written on Save, so a half-finished reshuffle never reaches
 // storage — and so one write covers a whole editing session rather than one per keystroke.
 function ProgramEditor({ program, onCommit, onReset, onBack }) {
+  const t = useT();
+  const lang = useLang();
+  const dayName = useDayName();
   const [draft, setDraft] = useState(program);
   const [openDayId, setOpenDayId] = useState(program.days[0] ? program.days[0].id : null);
   const [editingId, setEditingId] = useState(null);
@@ -2713,7 +2894,7 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
     const pattern = "push-horizontal";
     const next = [
       ...(draft.exercisesByDay[dayId] || []),
-      { id, name: "New exercise", muscle: "", target: "3 x 8-12", rest: DEFAULT_REST, link: "", pattern, meta: metaFromPattern(pattern) },
+      { id, name: t("log.newExercise"), muscle: "", target: "3 x 8-12", rest: DEFAULT_REST, link: "", pattern, meta: metaFromPattern(pattern) },
     ];
     setDayExercises(dayId, next);
     setEditingId(id);
@@ -2723,7 +2904,7 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
     const id = "d" + uid().slice(-6);
     setDraft((p) => ({
       ...p,
-      days: [...p.days, { id, name: `Day ${p.days.length + 1}`, subtitle: "" }],
+      days: [...p.days, { id, name: t("prog.dayN", { n: p.days.length + 1 }), subtitle: "" }],
       exercisesByDay: { ...p.exercisesByDay, [id]: [] },
     }));
     setOpenDayId(id);
@@ -2745,7 +2926,7 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
   async function save() {
     const res = await onCommit(draft);
     if (res && res.ok) {
-      setStatus("Saved");
+      setStatus(t("log.saved"));
       setTimeout(() => setStatus(""), 2000);
     }
   }
@@ -2753,15 +2934,11 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
   return (
     <div className="px-4 pt-4">
       <button onClick={onBack} className="flex items-center gap-1.5 text-sm text-gray-500 mb-3">
-        <ChevronDown size={15} className="rotate-90" /> Back to Profile
+        <ChevronDown size={15} className="rotate-90" /> {t("prog.back")}
       </button>
 
-      <h2 className="text-2xl font-bold tracking-tight mb-1">Your program</h2>
-      <p className="text-sm text-gray-500 mb-4 leading-snug">
-        Changes here apply to every future workout. To change just today's session — a busy
-        machine, say — use <span className="font-semibold">Swap</span> on the exercise card in the
-        Log tab instead.
-      </p>
+      <h2 className="text-2xl font-bold tracking-tight mb-1">{t("prog.title")}</h2>
+      <p className="text-sm text-gray-500 mb-4 leading-snug">{t("prog.explain")}</p>
 
       <div className="space-y-2.5">
         {draft.days.map((d) => {
@@ -2775,25 +2952,29 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
               >
                 {open ? <ChevronUp size={15} className="text-gray-500 shrink-0" /> : <ChevronDown size={15} className="text-gray-500 shrink-0" />}
                 <span className="flex-1 min-w-0">
-                  <span className="block text-sm font-semibold truncate">{d.name}</span>
-                  <span className="block text-xs text-gray-500">{list.length} exercise{list.length === 1 ? "" : "s"}</span>
+                  <span className="block text-sm font-semibold truncate">{dayName(d)}</span>
+                  <span className="block text-xs text-gray-500">{t("hist.exerciseCount", { n: list.length, unit: plural(lang, list.length, "unit.exercise") })}</span>
                 </span>
               </button>
 
               {open && (
                 <div className="px-3.5 pb-3.5">
                   <div className="flex gap-1.5 mb-2.5">
+                    {/* The editable field shows the STORED name, not the translated one —
+                        editing a built-in day means renaming it for yourself, and seeding the
+                        box with our translation would silently convert it into a custom name
+                        the moment anyone touched it. */}
                     <input
                       value={d.name}
                       onChange={(e) => updateDay(d.id, { name: e.target.value })}
-                      placeholder="Day name"
+                      placeholder={t("prog.dayName")}
                       className="flex-1 min-w-0 bg-white rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
                     />
                     <button
                       onClick={() => removeDay(d.id)}
                       disabled={draft.days.length <= 1}
                       className={`shrink-0 rounded-md px-2.5 ${draft.days.length <= 1 ? "bg-gray-100 text-gray-300" : "bg-gray-100 text-gray-600"}`}
-                      title={draft.days.length <= 1 ? "A program needs at least one day" : "Delete this day"}
+                      title={draft.days.length <= 1 ? t("prog.needOneDay") : t("prog.deleteDay")}
                     >
                       <Trash2 size={15} />
                     </button>
@@ -2801,7 +2982,7 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
                   <input
                     value={d.subtitle || ""}
                     onChange={(e) => updateDay(d.id, { subtitle: e.target.value })}
-                    placeholder="Short description (optional)"
+                    placeholder={t("prog.dayDescription")}
                     className="w-full mb-3 bg-white rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
                   />
 
@@ -2820,7 +3001,7 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
                       />
                     ))}
                     {list.length === 0 && (
-                      <p className="text-xs text-gray-400 py-2">No exercises on this day yet.</p>
+                      <p className="text-xs text-gray-400 py-2">{t("prog.noExercises")}</p>
                     )}
                   </div>
 
@@ -2828,7 +3009,7 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
                     onClick={() => addExercise(d.id)}
                     className="w-full mt-2 flex items-center justify-center gap-1.5 rounded-md border border-dashed border-gray-300 text-gray-500 text-sm py-2"
                   >
-                    <Plus size={15} /> Add exercise
+                    <Plus size={15} /> {t("prog.addExercise")}
                   </button>
                 </div>
               )}
@@ -2841,7 +3022,7 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
         onClick={addDay}
         className="w-full mt-3 flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-gray-200 text-gray-500 text-sm py-2.5"
       >
-        <Plus size={15} /> Add a day
+        <Plus size={15} /> {t("prog.addDay")}
       </button>
 
       <button
@@ -2851,30 +3032,29 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
           dirty ? "bg-maroon-600 text-white" : "bg-gray-100 text-gray-400"
         }`}
       >
-        {status || (dirty ? <><Save size={16} /> Save program</> : "No changes")}
+        {status || (dirty ? <><Save size={16} /> {t("prog.save")}</> : t("prog.noChanges"))}
       </button>
 
       <div className="mt-5 rounded-xl bg-gray-50 border border-gray-200 px-4 py-3">
-        <p className="text-sm text-gray-500 leading-snug mb-2">
-          Your rating is calculated across the exercises in this program. Removing one stops it
-          counting against you; adding one starts it counting as untrained until you log it.
-          Past sessions are kept either way.
-        </p>
+        {/* NB: this paragraph describes the OLD program-relative rating. Under fixed pattern
+            slots your program no longer moves your score at all — flagged rather than
+            silently reworded, because correcting it is a copy decision, not a translation. */}
+        <p className="text-sm text-gray-500 leading-snug mb-2">{t("prog.ratingNote")}</p>
         {confirmReset ? (
           <div className="flex gap-1.5">
             <button
               onClick={() => { setConfirmReset(false); onReset(); }}
               className="flex-1 bg-maroon-600 text-white text-sm font-semibold rounded-md py-2"
             >
-              Yes, restore the default
+              {t("prog.confirmRestore")}
             </button>
             <button onClick={() => setConfirmReset(false)} className="flex-1 bg-white border border-gray-200 text-gray-600 text-sm font-semibold rounded-md py-2">
-              Cancel
+              {t("common.cancel")}
             </button>
           </div>
         ) : (
           <button onClick={() => setConfirmReset(true)} className="text-sm font-semibold text-gray-600">
-            Restore the built-in 4-day split
+            {t("prog.restore")}
           </button>
         )}
       </div>
@@ -2883,15 +3063,17 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
 }
 
 function ProgramExerciseRow({ exercise, editing, canMoveUp, canMoveDown, onToggleEdit, onChange, onMove, onRemove }) {
+  const t = useT();
+  const exName = useExerciseName();
   const pattern = patternById(exercise.pattern) || null;
 
   return (
     <div className="rounded-md bg-white border border-gray-200">
       <div className="flex items-center gap-1 px-2.5 py-2">
         <button onClick={onToggleEdit} className="flex-1 min-w-0 text-left">
-          <span className="block text-sm font-semibold truncate">{exercise.name}</span>
+          <span className="block text-sm font-semibold truncate">{exName(exercise)}</span>
           <span className="block text-xs text-gray-500 truncate">
-            {exercise.target || "no target"}{pattern ? ` · ${pattern.label}` : ""}
+            {exercise.target || t("prog.noTarget")}{pattern ? ` · ${t(`pat.${pattern.id}`)}` : ""}
           </span>
         </button>
         <button
@@ -2915,16 +3097,17 @@ function ProgramExerciseRow({ exercise, editing, canMoveUp, canMoveDown, onToggl
 
       {editing && (
         <div className="px-2.5 pb-2.5 space-y-1.5 border-t border-gray-100 pt-2.5">
+          {/* Stored name again, not the translated one — same reason as the day-name field. */}
           <input
             value={exercise.name}
             onChange={(e) => onChange({ name: e.target.value })}
-            placeholder="Exercise name"
+            placeholder={t("log.exerciseName")}
             className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
           <input
             value={exercise.muscle || ""}
             onChange={(e) => onChange({ muscle: e.target.value })}
-            placeholder="Muscles worked (optional)"
+            placeholder={t("prog.muscles")}
             className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
           <div className="flex gap-1.5">
@@ -2939,35 +3122,24 @@ function ProgramExerciseRow({ exercise, editing, canMoveUp, canMoveDown, onToggl
               inputMode="numeric"
               value={exercise.rest || ""}
               onChange={(e) => onChange({ rest: Number(toNumber(e.target.value)) || DEFAULT_REST })}
-              placeholder="rest s"
+              placeholder={t("prog.restSeconds")}
               className="w-24 bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
             />
           </div>
           <input
             value={exercise.link || ""}
             onChange={(e) => onChange({ link: e.target.value })}
-            placeholder="Form video link (optional)"
+            placeholder={t("prog.formLink")}
             className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
-          <p className="text-xs text-gray-500 pt-1 leading-snug">
-            Movement pattern — the rating has no benchmark for a lift it's never seen, so it
-            borrows the pattern's. Rough family averages, not measurements of this exercise.
-          </p>
-          <select
-            value={exercise.pattern || "isolation-upper"}
-            onChange={(e) => onChange({ pattern: e.target.value, meta: metaFromPattern(e.target.value) })}
-            style={{ colorScheme: "light" }}
+          <p className="text-xs text-gray-500 pt-1 leading-snug">{t("prog.patternNote")}</p>
+          <PatternSelect
+            value={exercise.pattern}
+            onChange={(next) => onChange({ pattern: next, meta: metaFromPattern(next) })}
             className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
-          >
-            {MOVEMENT_PATTERNS.map((p) => (
-              <option key={p.id} value={p.id}>{p.label} — {p.hint}</option>
-            ))}
-          </select>
+          />
           {exercise.builtIn && (
-            <p className="text-xs text-gray-400 leading-snug">
-              This is one of the built-in lifts. Changing its pattern overrides the benchmark it
-              shipped with.
-            </p>
+            <p className="text-xs text-gray-400 leading-snug">{t("prog.builtInNote")}</p>
           )}
         </div>
       )}
@@ -2987,9 +3159,9 @@ function ProgramExerciseRow({ exercise, editing, canMoveUp, canMoveDown, onToggl
 // and the whole point is pasting into a chat anyway.
 
 const EXPORT_RANGES = [
-  { id: "4w", label: "Last 4 weeks", days: 28 },
-  { id: "12w", label: "Last 3 months", days: 84 },
-  { id: "all", label: "Everything", days: null },
+  { id: "4w", days: 28 },
+  { id: "12w", days: 84 },
+  { id: "all", days: null },
 ];
 
 function sessionsInRange(sessions, days) {
@@ -3000,32 +3172,36 @@ function sessionsInRange(sessions, days) {
   return sessions.filter((s) => s.date >= cutoffISO);
 }
 
-function describeSet(s) {
-  return `${s.weight}kg×${s.reps}` + (s.drops || []).map((d) => ` → ${d.weight}kg×${d.reps}`).join("");
+function describeSet(s, kg) {
+  return `${s.weight}${kg}×${s.reps}` + (s.drops || []).map((d) => ` → ${d.weight}${kg}×${d.reps}`).join("");
 }
 
-function buildExportMarkdown(sessions, profile, rangeLabel, program) {
+function buildExportMarkdown(sessions, profile, rangeLabel, program, lang = DEFAULT_LANG) {
   const sorted = [...sessions].sort((a, b) => (a.date < b.date ? 1 : -1));
   const weight = Number(profile.weightKg) || null;
   const elo = computeEloTrajectory(sorted, weight, program);
+  const tr = (key, vars) => t(lang, key, vars);
+  const kg = tr("unit.kg");
+  const exName = (e) => exerciseDisplayName(lang, e && e.id, e && e.name);
+  const dyName = (d) => dayDisplayName(lang, d && d.id, d && d.name);
   const slotNames = {};
-  if (program) programSlots(program).forEach((s) => { slotNames[s.id] = s.name; });
+  if (program) programSlots(program).forEach((s) => { slotNames[s.id] = exName(s); });
   const L = [];
 
-  L.push("# Chetamba training export");
+  L.push(`# ${tr("exp.title")}`);
   L.push("");
-  L.push(`- Exported: ${todayISO()}`);
-  L.push(`- Range: ${rangeLabel} — ${sorted.length} session${sorted.length === 1 ? "" : "s"}`);
-  if (profile.displayName) L.push(`- Athlete: ${profile.displayName}`);
-  const bio = [profile.heightCm ? `${profile.heightCm} cm` : null, weight ? `${weight} kg` : null].filter(Boolean).join(" · ");
-  if (bio) L.push(`- Body: ${bio}`);
+  L.push(`- ${tr("exp.exported")}: ${todayISO()}`);
+  L.push(`- ${tr("exp.range")}: ${rangeLabel} — ${sorted.length} ${plural(lang, sorted.length, "unit.session")}`);
+  if (profile.displayName) L.push(`- ${tr("exp.athlete")}: ${profile.displayName}`);
+  const bio = [profile.heightCm ? `${profile.heightCm} ${tr("unit.cm")}` : null, weight ? `${weight} ${kg}` : null].filter(Boolean).join(" · ");
+  if (bio) L.push(`- ${tr("exp.body")}: ${bio}`);
   if (weight && elo.trajectory.length) {
-    L.push(`- Rating: ${elo.rating} (${tierForRating(elo.rating).tier.name}) — see the caveat at the bottom`);
+    L.push(`- ${tr("exp.rating")}: ${elo.rating} (${tr(`tier.${tierForRating(elo.rating).tier.name}`)}) — ${tr("exp.seeCaveat")}`);
   }
 
   if (sorted.length === 0) {
     L.push("");
-    L.push("_No sessions in this range._");
+    L.push(`_${tr("exp.noSessions")}_`);
     return L.join("\n");
   }
 
@@ -3033,27 +3209,27 @@ function buildExportMarkdown(sessions, profile, rangeLabel, program) {
   // (§1), so make it impossible for a reviewer to miss.
   const spanDays = Math.max(1, diffDaysBetween(sorted[0].date, sorted[sorted.length - 1].date) + 1);
   const perWeek = (sorted.length / (spanDays / 7)).toFixed(1);
-  L.push(`- Frequency: ${perWeek} sessions/week across ${spanDays} days`);
+  L.push(`- ${tr("exp.frequency", { perWeek, days: spanDays })}`);
   L.push("");
-  L.push("## Day balance");
+  L.push(`## ${tr("exp.dayBalance")}`);
   L.push("");
   const progDays = (program && program.days) || DEFAULT_PROGRAM.days;
   progDays.forEach((d) => {
     const n = sorted.filter((s) => (s.dayId || slugId(s.day)) === d.id).length;
-    L.push(`- ${d.name}: ${n}`);
+    L.push(`- ${dyName(d)}: ${n}`);
   });
   const dayIds = new Set(progDays.map((d) => d.id));
   const other = sorted.filter((s) => !dayIds.has(s.dayId || slugId(s.day))).length;
-  if (other) L.push(`- Days no longer in the program: ${other}`);
+  if (other) L.push(`- ${tr("exp.daysNotInProgram")}: ${other}`);
 
   // The program itself, so a reviewer can tell "not in the program" from "skipped".
   L.push("");
-  L.push("## Current program");
+  L.push(`## ${tr("exp.currentProgram")}`);
   progDays.forEach((d) => {
     L.push("");
-    L.push(`**${d.name}**${d.subtitle ? ` — ${d.subtitle}` : ""}`);
+    L.push(`**${dyName(d)}**${d.subtitle ? ` — ${d.subtitle}` : ""}`);
     exercisesForDay(program || DEFAULT_PROGRAM, d.id).forEach((e) => {
-      L.push(`- ${e.name}${e.target ? ` — ${e.target}` : ""}`);
+      L.push(`- ${exName(e)}${e.target ? ` — ${e.target}` : ""}`);
     });
   });
 
@@ -3062,48 +3238,44 @@ function buildExportMarkdown(sessions, profile, rangeLabel, program) {
   const flagged = [];
   sorted.forEach((s) => {
     s.exercises.forEach((e) => {
-      if (noteSignalsProblem(e.notes)) flagged.push(`- ${s.date} · ${e.name}: "${String(e.notes).trim()}"`);
+      if (noteSignalsProblem(e.notes)) flagged.push(`- ${s.date} · ${exName(e)}: "${String(e.notes).trim()}"`);
     });
   });
   if (flagged.length) {
     L.push("");
-    L.push("## Flagged as painful or uncomfortable");
+    L.push(`## ${tr("exp.flagged")}`);
     L.push("");
-    L.push("These came from the athlete's own notes. Treat them as constraints, not as things to push through.");
+    L.push(tr("exp.flaggedNote"));
     L.push("");
     flagged.forEach((f) => L.push(f));
   }
 
   L.push("");
-  L.push("## Sessions (newest first)");
+  L.push(`## ${tr("exp.sessions")}`);
   sorted.forEach((s) => {
     L.push("");
-    L.push(`### ${s.date} · ${s.day}${s.duration ? ` · ${s.duration} min` : ""}`);
+    const dayLabel = s.kind === "activity"
+      ? tr(`act.${s.activityType}`)
+      : dyName({ id: s.dayId || slugId(s.day || ""), name: s.day });
+    L.push(`### ${s.date} · ${dayLabel}${s.duration ? ` · ${tr("hist.minutes", { n: s.duration })}` : ""}`);
     L.push("");
     s.exercises.forEach((e) => {
       const meta = metaForEntry(e, program);
-      const sets = e.sets.map(describeSet).join(", ");
-      const unit = meta.type === "duration" ? " (reps column is seconds)" : "";
+      const sets = e.sets.map((x) => describeSet(x, kg)).join(", ");
+      const unit = meta.type === "duration" ? ` (${tr("exp.repsAreSeconds")})` : "";
       // Flag substitutions inline. A reviewer comparing week to week would otherwise read a
       // one-off swap as the athlete abandoning a lift.
       const slot = e.substituteFor ? (slotNames[e.substituteFor] || e.substituteForName) : null;
-      const via = slot ? ` _(swapped in for ${slot} that day)_` : "";
-      L.push(`- **${e.name}**: ${sets || "no sets logged"}${unit}${via}`);
-      if (e.notes) L.push(`  - note: "${String(e.notes).trim()}"`);
+      const via = slot ? ` _(${tr("exp.swappedInFor", { slot })})_` : "";
+      L.push(`- **${exName(e)}**: ${sets || tr("exp.noSets")}${unit}${via}`);
+      if (e.notes) L.push(`  - ${tr("exp.note")}: "${String(e.notes).trim()}"`);
     });
   });
 
   L.push("");
-  L.push("## How to read this");
+  L.push(`## ${tr("exp.howToRead")}`);
   L.push("");
-  L.push("- Weights are per dumbbell/machine as entered, in kg. `20kg×12` is 20 kg for 12 reps.");
-  L.push("- `→` marks a drop set: the athlete went to failure and immediately continued lighter.");
-  L.push("- Duration work (planks, rowing) is logged as **seconds in the reps field** — a known rough edge.");
-  L.push("- The rating is a bodyweight-relative score run through Elo-style maths. There is no");
-  L.push("  published strength-standard database for dumbbell lifts, so its benchmarks are");
-  L.push("  directional estimates derived from barbell standards.");
-  L.push("- It is a game score, not a clinical measure — don't reason about health from it.");
-  L.push("- Sessions are only what was logged. An absent exercise may have been skipped or just not recorded.");
+  tr("exp.legend").split("\n").forEach((line) => L.push(line));
 
   return L.join("\n");
 }
@@ -3123,6 +3295,8 @@ function buildExportJSON(sessions, profile) {
 }
 
 function ExportPanel({ sessions, profile, program }) {
+  const t = useT();
+  const lang = useLang();
   const [rangeId, setRangeId] = useState("4w");
   const [copied, setCopied] = useState("");
   const [fallback, setFallback] = useState("");
@@ -3155,12 +3329,9 @@ function ExportPanel({ sessions, profile, program }) {
     <div className="mt-5 rounded-xl bg-gray-50 border border-gray-200 px-4 py-3.5">
       <div className="flex items-center gap-1.5 mb-2.5">
         <FileText size={14} className="text-maroon-600" />
-        <p className="text-sm uppercase tracking-wider text-gray-500 font-semibold">Export</p>
+        <p className="text-sm uppercase tracking-wider text-gray-500 font-semibold">{t("exp.panelTitle")}</p>
       </div>
-      <p className="text-sm text-gray-500 mb-3 leading-snug">
-        Copy your training out to review it somewhere else, or to keep a backup. Telegram's
-        storage is the only copy of this data.
-      </p>
+      <p className="text-sm text-gray-500 mb-3 leading-snug">{t("exp.panelExplain")}</p>
 
       <div className="flex gap-1.5 mb-3">
         {EXPORT_RANGES.map((r) => (
@@ -3171,37 +3342,35 @@ function ExportPanel({ sessions, profile, program }) {
               rangeId === r.id ? "bg-maroon-600 text-white" : "bg-white text-gray-500 border border-gray-200"
             }`}
           >
-            {r.label}
+            {t(`exp.range.${r.id}`)}
           </button>
         ))}
       </div>
 
       <p className="text-sm text-gray-400 mb-2">
-        {scoped.length} session{scoped.length === 1 ? "" : "s"} in range
+        {t("exp.inRange", { n: scoped.length, unit: plural(lang, scoped.length, "unit.session") })}
       </p>
 
       <button
-        onClick={() => copy(buildExportMarkdown(scoped, profile, range.label, program), "md")}
+        onClick={() => copy(buildExportMarkdown(scoped, profile, t(`exp.range.${range.id}`), program, lang), "md")}
         disabled={scoped.length === 0}
         className={`w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold mb-1.5 ${
           scoped.length === 0 ? "bg-gray-200 text-gray-400" : "bg-maroon-600 text-white"
         }`}
       >
-        {copied === "md" ? <><Check size={15} /> Copied — paste it into the chat</> : <><Copy size={15} /> Copy for review</>}
+        {copied === "md" ? <><Check size={15} /> {t("exp.copiedMd")}</> : <><Copy size={15} /> {t("exp.copyMd")}</>}
       </button>
       <button
         onClick={() => copy(buildExportJSON(scoped, profile), "json")}
         disabled={scoped.length === 0}
         className="w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold bg-white text-gray-700 border border-gray-200"
       >
-        {copied === "json" ? <><Check size={15} /> Backup copied</> : <><Save size={15} /> Copy backup (JSON)</>}
+        {copied === "json" ? <><Check size={15} /> {t("exp.copiedJson")}</> : <><Save size={15} /> {t("exp.copyJson")}</>}
       </button>
 
       {fallback && (
         <div className="mt-2.5">
-          <p className="text-sm text-maroon-700 mb-1.5">
-            Couldn't reach the clipboard here — select all of this and copy it manually.
-          </p>
+          <p className="text-sm text-maroon-700 mb-1.5">{t("exp.clipboardFailed")}</p>
           <textarea
             ref={fallbackRef}
             readOnly
@@ -3212,16 +3381,15 @@ function ExportPanel({ sessions, profile, program }) {
         </div>
       )}
 
-      <p className="text-sm text-gray-400 mt-2.5 leading-snug">
-        "Copy for review" is readable text meant for a person or a chat. "Copy backup" is the
-        raw data — keep that one somewhere safe.
-      </p>
+      <p className="text-sm text-gray-400 mt-2.5 leading-snug">{t("exp.footnote")}</p>
     </div>
   );
 }
 
 // ---------- Rating Card (Elo-style score, shown at top of Progress tab) ----------
 function RatingCard({ eloResult, profile }) {
+  const t = useT();
+  const lang = useLang();
   const hasWeight = !!Number(profile.weightKg);
 
   if (!hasWeight) {
@@ -3229,9 +3397,9 @@ function RatingCard({ eloResult, profile }) {
       <div className="mb-5 rounded-xl bg-gray-900 text-white px-4 py-4">
         <div className="flex items-center gap-1.5 mb-1.5">
           <Award size={14} className="text-maroon-400" />
-          <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">Rating</p>
+          <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">{t("prog.rating")}</p>
         </div>
-        <p className="text-sm text-gray-300">Add your weight in the Profile tab to unlock your rating.</p>
+        <p className="text-sm text-gray-300">{t("prog.needWeight")}</p>
       </div>
     );
   }
@@ -3251,12 +3419,12 @@ function RatingCard({ eloResult, profile }) {
     <div className="mb-5 rounded-xl bg-gray-900 text-white px-4 py-4">
       <div className="flex items-center gap-1.5 mb-2">
         <Award size={14} className="text-maroon-400" />
-        <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">Rating</p>
+        <p className="text-xs uppercase tracking-wider text-gray-400 font-semibold">{t("prog.rating")}</p>
       </div>
 
       <div className="flex items-end gap-3 mb-1">
         <span className="font-mono text-4xl font-bold tabular-nums leading-none">{trajectory.length ? rating : RATING_BASELINE}</span>
-        <span className={`text-xs font-semibold px-2 py-1 rounded ${tier.bg} ${tier.color}`}>{tier.name}</span>
+        <span className={`text-xs font-semibold px-2 py-1 rounded ${tier.bg} ${tier.color}`}>{t(`tier.${tier.name}`)}</span>
         {trajectory.length > 1 && change !== 0 && (
           <span className={`text-xs font-semibold ml-auto mb-1 ${change > 0 ? "text-emerald-400" : "text-maroon-400"}`}>
             {change > 0 ? "+" : ""}{change}
@@ -3265,7 +3433,7 @@ function RatingCard({ eloResult, profile }) {
       </div>
 
       {trajectory.length === 0 && (
-        <p className="text-xs text-gray-400 mt-1">Log your first session to get your starting rating.</p>
+        <p className="text-xs text-gray-400 mt-1">{t("prog.logFirst")}</p>
       )}
 
       {/* The layoff penalty is gone. Time off already shows up on the weekly effort axis,
@@ -3277,7 +3445,11 @@ function RatingCard({ eloResult, profile }) {
           <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
             <div className="h-full bg-maroon-500 rounded-full" style={{ width: `${pctToNext * 100}%` }} />
           </div>
-          <p className="text-xs text-gray-400 mt-1.5">{next.min - rating > 0 ? `${next.min - rating} to ${next.name}` : `Ready for ${next.name}`}</p>
+          <p className="text-xs text-gray-400 mt-1.5">
+            {next.min - rating > 0
+              ? t("prog.toNextTier", { n: next.min - rating, tier: t(`tier.${next.name}`) })
+              : t("prog.readyForTier", { tier: t(`tier.${next.name}`) })}
+          </p>
         </div>
       )}
 
@@ -3289,8 +3461,8 @@ function RatingCard({ eloResult, profile }) {
               <Tooltip
                 contentStyle={{ background: "#111827", border: "1px solid #374151", borderRadius: 8, fontSize: 11 }}
                 labelStyle={{ color: "#9ca3af" }}
-                formatter={(v) => [v, "Rating"]}
-                labelFormatter={(l, p) => (p && p[0] ? fmtDate(p[0].payload.date) : "")}
+                formatter={(v) => [v, t("prog.rating")]}
+                labelFormatter={(l, p) => (p && p[0] ? fmtDate(p[0].payload.date, lang) : "")}
               />
             </LineChart>
           </ResponsiveContainer>
@@ -3299,16 +3471,13 @@ function RatingCard({ eloResult, profile }) {
 
       {staleCount > 0 && trajectory.length > 0 && (
         <p className="text-xs text-gray-500 mt-3">
-          {staleCount} exercise{staleCount > 1 ? "s" : ""} untouched or fading — training them keeps your climb faster.
+          {t("prog.staleCount", { n: staleCount, unit: plural(lang, staleCount, "unit.exercise") })}
         </p>
       )}
 
       {/* Honesty note — see workout_tracker.md §6. There is no published strength-standard
           database for dumbbell lifts, so the benchmarks are derived estimates. Keep this visible. */}
-      <p className="text-xs text-gray-500 mt-3 leading-snug">
-        Benchmarks are directional estimates derived from barbell standards — no published dumbbell
-        strength database exists. Treat this as a game score, not a clinical measure.
-      </p>
+      <p className="text-xs text-gray-500 mt-3 leading-snug">{t("prog.benchmarkCaveat")}</p>
     </div>
   );
 }
@@ -3334,6 +3503,7 @@ function parseScoreCard(text) {
 }
 
 function Leaderboard({ displayName, rating, tierName }) {
+  const t = useT();
   const [rivals, setRivals] = useState([]);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteVal, setPasteVal] = useState("");
@@ -3370,11 +3540,11 @@ function Leaderboard({ displayName, rating, tierName }) {
   function addRival() {
     const parsed = parseScoreCard(pasteVal);
     if (!parsed) {
-      setPasteErr("That doesn't look like a score card — paste the whole GAINS|... line.");
+      setPasteErr(t("board.badCard"));
       return;
     }
     if (displayName && parsed.name.toLowerCase() === displayName.toLowerCase()) {
-      setPasteErr("That's your own card.");
+      setPasteErr(t("board.ownCard"));
       return;
     }
     const next = [...rivals.filter((r) => r.name.toLowerCase() !== parsed.name.toLowerCase()), parsed];
@@ -3393,11 +3563,11 @@ function Leaderboard({ displayName, rating, tierName }) {
     <div className="mb-5 rounded-xl bg-gray-50 border border-gray-200 px-4 py-3.5">
       <div className="flex items-center gap-1.5 mb-2.5">
         <Users size={13} className="text-maroon-600" />
-        <p className="text-xs uppercase tracking-wider text-gray-500 font-semibold">Leaderboard</p>
+        <p className="text-xs uppercase tracking-wider text-gray-500 font-semibold">{t("board.title")}</p>
       </div>
 
       {!displayName && (
-        <p className="text-xs text-gray-500 mb-2.5">Set a display name in the Profile tab to join.</p>
+        <p className="text-xs text-gray-500 mb-2.5">{t("board.needName")}</p>
       )}
 
       {board.length > 0 && (
@@ -3410,7 +3580,7 @@ function Leaderboard({ displayName, rating, tierName }) {
               }`}
             >
               <span className="text-xs font-semibold text-gray-700 truncate">
-                {i + 1}. {e.name}{e.me ? " (you)" : ""}
+                {i + 1}. {e.name}{e.me ? ` ${t("board.you")}` : ""}
               </span>
               <span className="font-mono text-xs tabular-nums text-gray-900 shrink-0 ml-2">{e.rating}</span>
             </div>
@@ -3423,13 +3593,13 @@ function Leaderboard({ displayName, rating, tierName }) {
           onClick={shareCard}
           className="flex-1 flex items-center justify-center gap-1.5 bg-maroon-600 text-white text-xs font-semibold rounded-md py-2"
         >
-          <Share2 size={12} /> {copied ? "Copied!" : "Share my score"}
+          <Share2 size={12} /> {copied ? t("board.copied") : t("board.share")}
         </button>
         <button
           onClick={() => setPasteOpen((v) => !v)}
           className="flex-1 flex items-center justify-center gap-1.5 bg-white border border-gray-200 text-gray-700 text-xs font-semibold rounded-md py-2"
         >
-          <Plus size={12} /> Add friend's score
+          <Plus size={12} /> {t("board.addFriend")}
         </button>
       </div>
 
@@ -3439,35 +3609,47 @@ function Leaderboard({ displayName, rating, tierName }) {
             value={pasteVal}
             onChange={(e) => { setPasteVal(e.target.value); setPasteErr(""); }}
             rows={2}
-            placeholder="Paste their GAINS|... line here"
+            placeholder={t("board.pastePlaceholder")}
             className="w-full resize-none bg-white rounded-md px-2.5 py-2 text-xs text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
           <button onClick={addRival} className="w-full mt-1.5 bg-gray-900 text-white text-xs font-semibold rounded-md py-2">
-            Add to leaderboard
+            {t("board.addToBoard")}
           </button>
           {pasteErr && <p className="text-xs text-maroon-600 mt-1.5">{pasteErr}</p>}
         </div>
       )}
 
-      <p className="text-xs text-gray-400 mt-2.5">
-        Scores update only when you each re-share — it's a snapshot, not a live feed.
-      </p>
+      <p className="text-xs text-gray-400 mt-2.5">{t("board.snapshotNote")}</p>
     </div>
   );
 }
 
 function ProgressView({ sessions, profile, program }) {
-  const exerciseNames = useMemo(() => {
-    const set = new Set();
-    sessions.forEach((s) => s.exercises.forEach((e) => set.add(e.name)));
-    return Array.from(set).sort();
-  }, [sessions]);
+  const t = useT();
+  const lang = useLang();
+  const exName = useExerciseName();
 
-  const [selected, setSelected] = useState(exerciseNames[0] || "");
+  // Keyed by id, not by name. It used to group on the display name, which was already a
+  // latent bug — two exercises can share a name, and renaming one split its chart in two —
+  // and became a certain one here, since a built-in's displayed name now changes with the
+  // language. Grouping on the stable id is what the rest of the app already does.
+  const exerciseOptions = useMemo(() => {
+    const byId = new Map();
+    sessions.forEach((s) =>
+      (s.exercises || []).forEach((e) => {
+        const id = e.id || slugId(e.name);
+        if (!byId.has(id)) byId.set(id, { id, name: e.name });
+      })
+    );
+    return [...byId.values()].sort((a, b) => exName(a).localeCompare(exName(b), lang));
+  }, [sessions, exName, lang]);
+
+  const [selected, setSelected] = useState(exerciseOptions[0] ? exerciseOptions[0].id : "");
 
   useEffect(() => {
-    if (!selected && exerciseNames.length) setSelected(exerciseNames[0]);
-  }, [exerciseNames, selected]);
+    const stillThere = exerciseOptions.some((o) => o.id === selected);
+    if (!stillThere && exerciseOptions.length) setSelected(exerciseOptions[0].id);
+  }, [exerciseOptions, selected]);
 
   const eloResult = useMemo(
     () => computeEloTrajectory(sessions, Number(profile.weightKg) || null, program),
@@ -3476,23 +3658,24 @@ function ProgressView({ sessions, profile, program }) {
 
   const data = useMemo(() => {
     const rows = [];
+    const matches = (e) => (e.id || slugId(e.name)) === selected;
     sessions
-      .filter((s) => s.exercises.some((e) => e.name === selected))
+      .filter((s) => (s.exercises || []).some(matches))
       .sort((a, b) => (a.date > b.date ? 1 : -1))
       .forEach((s) => {
-        const ex = s.exercises.find((e) => e.name === selected);
+        const ex = s.exercises.find(matches);
         if (!ex || ex.sets.length === 0) return;
         const topWeight = Math.max(...ex.sets.map((st) => st.weight));
         const totalReps = ex.sets.reduce(
           (sum, st) => sum + st.reps + (st.drops ? st.drops.reduce((ds, d) => ds + d.reps, 0) : 0),
           0
         );
-        rows.push({ date: s.date, label: fmtDate(s.date), topWeight, totalReps, sets: ex.sets.length });
+        rows.push({ date: s.date, label: fmtDate(s.date, lang), topWeight, totalReps, sets: ex.sets.length });
       });
     return rows;
-  }, [sessions, selected]);
+  }, [sessions, selected, lang]);
 
-  if (exerciseNames.length === 0) {
+  if (exerciseOptions.length === 0) {
     return (
       <div className="px-4 pt-4">
         <RatingCard eloResult={eloResult} profile={profile} />
@@ -3501,8 +3684,8 @@ function ProgressView({ sessions, profile, program }) {
         )}
         <div className="px-1 pt-12 text-center">
           <TrendingUp size={28} className="mx-auto text-gray-400 mb-3" />
-          <p className="text-sm text-gray-500">No exercise data yet.</p>
-          <p className="text-xs text-gray-400 mt-1">Log a few sessions to see trends.</p>
+          <p className="text-sm text-gray-500">{t("prog.noData")}</p>
+          <p className="text-xs text-gray-400 mt-1">{t("prog.noDataHint")}</p>
         </div>
       </div>
     );
@@ -3525,8 +3708,8 @@ function ProgressView({ sessions, profile, program }) {
         style={{ colorScheme: "light" }}
         className="w-full bg-gray-100 rounded-md px-3 py-2.5 text-sm text-gray-900 border border-gray-200 mb-4 focus:outline-none focus:ring-2 focus:ring-maroon-600"
       >
-        {exerciseNames.map((n) => (
-          <option key={n} value={n}>{n}</option>
+        {exerciseOptions.map((o) => (
+          <option key={o.id} value={o.id}>{exName(o)}</option>
         ))}
       </select>
 
@@ -3534,10 +3717,10 @@ function ProgressView({ sessions, profile, program }) {
         <>
           <div className="flex items-baseline gap-2 mb-1">
             <span className="font-mono text-3xl font-bold tabular-nums">{latest.topWeight}</span>
-            <span className="text-sm text-gray-500">kg top set</span>
+            <span className="text-sm text-gray-500">{t("prog.topSet")}</span>
             {delta !== 0 && (
               <span className={`text-xs font-semibold ml-auto ${delta > 0 ? "text-emerald-600" : "text-maroon-600"}`}>
-                {delta > 0 ? "+" : ""}{delta}kg since first log
+                {delta > 0 ? "+" : ""}{t("prog.sinceFirst", { delta })}
               </span>
             )}
           </div>
@@ -3558,11 +3741,13 @@ function ProgressView({ sessions, profile, program }) {
           </div>
 
           <div className="mt-5 space-y-1.5">
-            <p className="text-xs uppercase tracking-wider text-gray-500 mb-2">Session log</p>
+            <p className="text-xs uppercase tracking-wider text-gray-500 mb-2">{t("prog.sessionLog")}</p>
             {[...data].reverse().map((d, i) => (
               <div key={i} className="flex items-center justify-between text-xs bg-gray-50 rounded-md px-3 py-2 border border-gray-200">
                 <span className="text-gray-500">{d.label}</span>
-                <span className="font-mono tabular-nums">{d.topWeight}kg · {d.sets} sets · {d.totalReps} reps</span>
+                <span className="font-mono tabular-nums">
+                  {d.topWeight}{t("unit.kg")} · {d.sets} {plural(lang, d.sets, "unit.set")} · {d.totalReps} {plural(lang, d.totalReps, "unit.rep")}
+                </span>
               </div>
             ))}
           </div>

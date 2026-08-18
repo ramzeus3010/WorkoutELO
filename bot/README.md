@@ -21,9 +21,28 @@ Since the group leaderboard landed, it also does:
 |---|---|---|
 | `/register` | in a group | Turns that chat into a leaderboard and returns a 7-day join code |
 | `/score`, `/top` | group or DM | Current standings, recomputed live |
+| `/language`, `/lang` | group or DM | In a DM, your own language; in a group, the board's |
 
 …plus it posts automatically when someone finishes a workout, announces the winner every
 Monday, and nudges the group on Sunday evening.
+
+### Languages
+
+English and Russian, from the same dictionary the Mini App uses (`src/i18n.js`), so the bot
+and the app never word the same thing differently.
+
+Three settings, deliberately separate:
+
+- **Per user.** Seeded from Telegram's `language_code` (Russian for `ru`/`kk`/`uk` and the
+  rest of the post-Soviet set), confirmed with two buttons on a first `/start`, and changed
+  later with `/language` or the switch in the app's Profile tab. Stored on the user's KV
+  record. The app sends its current language with every publish, so flipping the switch there
+  also changes the bot's DMs.
+- **Per group.** Chosen at `/register` — seeded from whoever ran it, then offered as buttons.
+  Every standings post, finish announcement and cron message in that chat uses it. A group
+  post has many readers and can only be in one language, so this can't be per user.
+- **A DM `/score`** uses the reader's own language even for a group's board. Same numbers,
+  different wording.
 
 ### The API the Mini App calls
 
@@ -102,6 +121,9 @@ For `/setcommands`, paste:
 start - Open Chetamba
 app - Open Chetamba
 help - How the app works
+language - English / Русский
+register - Turn this group into a leaderboard
+score - Current standings
 ```
 
 Optionally, to put an image above the `/start` message too, upload one to

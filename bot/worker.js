@@ -23,8 +23,12 @@
 import {
   verifyInitData, readUser, writeUser, emptyUser, applyPublish,
   standingFor, groupStandings, rankChange, makeJoinCode,
-  codeKey, memberKey, groupKey, leagueTodayISO, weekStartISO,
+  codeKey, memberKey, groupKey, groupLangKey, leagueTodayISO, weekStartISO,
 } from "./relay.js";
+// The same dictionary the Mini App renders from. Shared for the same reason scoring.js is:
+// the bot and the app describe the same events to the same people, and two copies of the
+// wording would drift until the group chat and the app disagreed.
+import { t, plural, detectLang, isLang, LANGS, DEFAULT_LANG } from "../src/i18n.js";
 
 // Cron expressions are UTC; the league runs on UTC+5 (Almaty). Monday 08:00 and Sunday 19:00
 // local. These must match wrangler.toml exactly — runCron() compares the string, so a typo
@@ -33,29 +37,39 @@ import {
 const MONDAY_CRON = "0 3 * * 1";
 const SUNDAY_CRON = "0 14 * * 7";
 
-const WELCOME = [
-  "*Chetamba* — your training log.",
-  "",
-  "Four-day upper/lower split, a rest timer you can read from across the gym, and a rating that",
-  "tracks whether you're actually getting stronger for your bodyweight.",
-  "",
-  "Everything is stored on your own Telegram account. No sign-up, no server, no ads.",
-  "",
-  "Tap below to open it. It picks up exactly where you left off — even mid-set.",
-].join("\n");
+// ---------- Language resolution ----------
+// Three separate questions, deliberately answered from three different places:
+//
+//   userLang(env, id, fallbackCode)  what a DM to one person is written in. Stored per user,
+//                                    seeded from their Telegram locale, overridden by the
+//                                    app's switch or the /language buttons.
+//   groupLang(env, groupId)          what the shared board posts in. One value per chat,
+//                                    chosen at /register — a group post has many readers and
+//                                    can only be in one language.
+//
+// Falling back to the Telegram-reported locale rather than to English matters: a brand new
+// user's very first /start should already be readable, since that message is the one asking
+// them which language they want.
+async function userLang(env, id, fallbackCode) {
+  if (id) {
+    const stored = await readUser(env, String(id));
+    if (stored && isLang(stored.lang)) return stored.lang;
+  }
+  return detectLang(fallbackCode);
+}
 
-const HELP = [
-  "*How it works*",
-  "",
-  "• *Log* — pick the day, enter weight × reps, hit Record. Sets save as you go, so closing",
-  "  the app mid-workout never loses anything.",
-  "• *History* — every past session.",
-  "• *Progress* — your rating, tier, and per-exercise charts.",
-  "• *Profile* — bodyweight (the rating is relative to it) and *Export*, for pulling your whole",
-  "  history out to review or back up.",
-  "",
-  "Commands: /start · /app · /help",
-].join("\n");
+async function groupLang(env, groupId) {
+  const stored = await env.CHETAMBA.get(groupLangKey(String(groupId)));
+  return isLang(stored) ? stored : DEFAULT_LANG;
+}
+
+// Two buttons, each labelled in its own language, so whichever one the reader understands is
+// legible. `prefix` picks whether the answer sets the personal or the group language.
+function langKeyboard(prefix) {
+  return {
+    inline_keyboard: [LANGS.map((l) => ({ text: l.label, callback_data: `${prefix}:${l.id}` }))],
+  };
+}
 
 // The Mini App is served from GitHub Pages, a different origin, so the browser preflights
 // every POST to /api/*. Restricted to the known origin rather than "*" — this endpoint
@@ -147,23 +161,29 @@ async function handleApi(pathname, request, env) {
   const today = leagueTodayISO();
   const existing = (await readUser(env, caller.id)) || emptyUser(caller.id, caller.firstName);
 
+  // Errors returned to the app are written in the CALLER's language: the app shows them
+  // verbatim, because only the Worker knows why the request failed.
+  const lang = isLang(body.lang) ? body.lang : await userLang(env, caller.id, null);
+
   if (pathname === "/api/join") {
     const code = String(body.code || "").trim().toUpperCase();
     const groupId = code ? await env.CHETAMBA.get(codeKey(code)) : null;
-    if (!groupId) return json(env, { ok: false, error: "That code isn't valid. Ask for a fresh one with /register in the group." }, 400);
+    if (!groupId) return json(env, { ok: false, error: t(lang, "bot.badCode") }, 400);
 
     // Leaving an old group shouldn't strand a membership key pointing at this user.
     if (existing.groupId && existing.groupId !== groupId) {
       await env.CHETAMBA.delete(memberKey(existing.groupId, caller.id));
     }
-    const joined = { ...existing, groupId, name: body.name || existing.name || caller.firstName };
+    const joined = { ...existing, groupId, name: body.name || existing.name || caller.firstName, lang };
     await writeUser(env, joined);
     await env.CHETAMBA.put(memberKey(groupId, caller.id), "1");
 
-    const title = (await env.CHETAMBA.get(groupKey(groupId))) || "the group";
+    const title = (await env.CHETAMBA.get(groupKey(groupId))) || t(lang, "bot.groupFallback");
+    // Announced in the GROUP's language, not the joiner's — everyone in the chat reads it.
+    const gl = await groupLang(env, groupId);
     await tg(env, "sendMessage", {
       chat_id: groupId,
-      text: `*${escapeMd(joined.name)}* joined the board.`,
+      text: t(gl, "bot.joinedBoard", { name: escapeMd(joined.name) }),
       parse_mode: "Markdown",
     });
     return json(env, { ok: true, groupTitle: title });
@@ -179,9 +199,10 @@ async function handleApi(pathname, request, env) {
 
     const after = await groupStandings(env, updated.groupId, today);
     const moved = rankChange(before, after, caller.id);
+    const gl = await groupLang(env, updated.groupId);
     await tg(env, "sendMessage", {
       chat_id: updated.groupId,
-      text: finishedMessage(updated, body, standingFor(updated, today), moved),
+      text: finishedMessage(updated, body, standingFor(updated, today), moved, gl),
       parse_mode: "Markdown",
       disable_web_page_preview: true,
     });
@@ -203,38 +224,66 @@ function escapeMd(s) {
   return String(s == null ? "" : s).replace(/([*_`\[\]])/g, "\\$1");
 }
 
-function finishedMessage(user, payload, standing, moved) {
+/**
+ * Resolve the label the client sent for a finished session.
+ *
+ * The app publishes a translation KEY ("day.upper-a", "act.hiking") rather than finished
+ * text, because the publisher's language and the board's language are different settings and
+ * the board's is the one that wins here. A custom day the user named themselves has no key —
+ * it arrives as `labelText` and is used verbatim, since translating what someone typed is not
+ * ours to do.
+ */
+function sessionLabel(payload, lang) {
+  const key = String(payload.label || "");
+  if (key) {
+    const translated = t(lang, key);
+    if (translated !== key) return translated;
+  }
+  if (payload.labelText) return payload.labelText;
+  return t(lang, payload.kind === "activity" ? "bot.anActivity" : "bot.aWorkout");
+}
+
+function finishedMessage(user, payload, standing, moved, lang) {
   const lines = [];
+  const label = escapeMd(sessionLabel(payload, lang));
   if (payload.kind === "activity") {
-    lines.push(`🏃 *${escapeMd(user.name)}* — ${escapeMd(payload.label || "activity")}, ${payload.minutes || 0} min`);
+    lines.push(t(lang, "bot.finishedActivity", { name: escapeMd(user.name), label, minutes: payload.minutes || 0 }));
   } else {
-    lines.push(`🏋️ *${escapeMd(user.name)}* finished ${escapeMd(payload.label || "a workout")}`);
+    lines.push(t(lang, "bot.finishedLift", { name: escapeMd(user.name), label }));
+    // Exercise names are whatever the publisher's app displayed them as. Not re-translated:
+    // the client already resolved built-ins, and a custom name is the user's own words.
     const names = (payload.exercises || []).slice(0, 6).map(escapeMd);
     if (names.length) lines.push(`_${names.join(" · ")}_`);
   }
   lines.push("");
-  lines.push(`Strength *${standing.strength}* · this week *${standing.effort.toFixed(1)}* effort over ${standing.sessions} session${standing.sessions === 1 ? "" : "s"}`);
+  lines.push(t(lang, "bot.strengthLine", {
+    strength: standing.strength,
+    effort: standing.effort.toFixed(1),
+    sessions: standing.sessions,
+    unit: plural(lang, standing.sessions, "unit.session"),
+  }));
   if (moved) {
-    lines.push(`📈 Up to *#${moved.to}*, past ${moved.passed.map(escapeMd).join(" and ")}.`);
+    lines.push(t(lang, "bot.movedUp", {
+      rank: moved.to,
+      passed: moved.passed.map(escapeMd).join(t(lang, "bot.and")),
+    }));
   }
   return lines.join("\n");
 }
 
-function boardMessage(standings, asOfIso, title) {
-  if (standings.length === 0) {
-    return "Nobody has joined the board yet. Run /register here, then paste the code into the app.";
-  }
+function boardMessage(standings, asOfIso, title, lang) {
+  if (standings.length === 0) return t(lang, "bot.emptyBoard");
   const medal = ["🥇", "🥈", "🥉"];
   const rows = standings.map((s, i) =>
     `${medal[i] || `${i + 1}.`} *${escapeMd(s.name)}* — ${s.total.toFixed(1)}  _(str ${s.strength} · eff ${s.effort.toFixed(1)})_`
   );
   return [
     `*${title}*`,
-    `_week of ${weekStartISO(asOfIso)} · effort resets Monday_`,
+    t(lang, "bot.weekOf", { date: weekStartISO(asOfIso) }),
     "",
     ...rows,
     "",
-    "_Scores are as of each person's last logged workout._",
+    t(lang, "bot.asOf"),
   ].join("\n");
 }
 
@@ -253,12 +302,13 @@ async function runCron(cron, env) {
     const groupId = key.name.split(":")[1];
     const standings = await groupStandings(env, groupId, today);
     if (standings.length === 0) continue;
+    const lang = await groupLang(env, groupId);
 
     // Sunday evening: the deadline nudge, while there's still time to act on it.
     if (cron === SUNDAY_CRON) {
       await tg(env, "sendMessage", {
         chat_id: groupId,
-        text: boardMessage(standings, today, "⏳ Final hours of the week"),
+        text: boardMessage(standings, today, t(lang, "bot.finalHours"), lang),
         parse_mode: "Markdown",
       });
       continue;
@@ -269,9 +319,9 @@ async function runCron(cron, env) {
     await tg(env, "sendMessage", {
       chat_id: groupId,
       text: [
-        `*New week.* Effort is back to zero for everyone.`,
+        t(lang, "bot.newWeek"),
         "",
-        `Last week: 🥇 *${escapeMd(winner.name)}* on ${winner.total.toFixed(1)}.`,
+        t(lang, "bot.lastWeekWinner", { name: escapeMd(winner.name), total: winner.total.toFixed(1) }),
       ].join("\n"),
       parse_mode: "Markdown",
     });
@@ -279,6 +329,12 @@ async function runCron(cron, env) {
 }
 
 async function handleUpdate(update, env) {
+  // The language buttons come back as callback queries, not messages.
+  if (update.callback_query) {
+    await handleLangChoice(update.callback_query, env);
+    return;
+  }
+
   const msg = update.message || update.edited_message;
   if (!msg) return;
 
@@ -286,16 +342,34 @@ async function handleUpdate(update, env) {
   if (!chatId) return;
   const isPrivate = msg.chat.type === "private";
   const text = (msg.text || "").trim();
+  const fromId = msg.from && msg.from.id;
+  const fromLocale = msg.from && msg.from.language_code;
 
   // "/start@somebot arg" -> "start"
   const command = text.startsWith("/") ? text.slice(1).split(/[\s@]/)[0].toLowerCase() : null;
 
+  // In a group, everything is written in the board's language; in a DM, in the reader's own.
+  const lang = isPrivate ? await userLang(env, fromId, fromLocale) : await groupLang(env, chatId);
+
   if (command === "start" || command === "app") {
-    await sendOpenCard(chatId, isPrivate, WELCOME, env);
+    await sendOpenCard(chatId, isPrivate, t(lang, "bot.welcome"), env, lang);
+    // Only in a DM, and only on a first /start: the guess from Telegram's locale is usually
+    // right, so this confirms rather than interrogates. Asking in a group would be asking
+    // everyone at once, and the group's language belongs to /register instead.
+    if (isPrivate && command === "start") {
+      const known = fromId ? await readUser(env, String(fromId)) : null;
+      if (!known || !isLang(known.lang)) await askLanguage(chatId, lang, "lang", env);
+    }
     return;
   }
   if (command === "help") {
-    await sendOpenCard(chatId, isPrivate, HELP, env);
+    await sendOpenCard(chatId, isPrivate, t(lang, "bot.help"), env, lang);
+    return;
+  }
+
+  // Changing your mind later, without hunting through the app.
+  if (command === "language" || command === "lang") {
+    await askLanguage(chatId, lang, isPrivate ? "lang" : "glang", env);
     return;
   }
 
@@ -303,24 +377,29 @@ async function handleUpdate(update, env) {
   // fresh code each time is deliberate: it's how you re-invite people without any admin UI.
   if (command === "register") {
     if (isPrivate) {
-      await tg(env, "sendMessage", { chat_id: chatId, text: "Run /register inside the group chat you want to compete in." });
+      await tg(env, "sendMessage", { chat_id: chatId, text: t(lang, "bot.registerInGroup") });
       return;
     }
     const code = makeJoinCode();
     // Codes expire so a screenshot in an old chat can't be used to join months later.
     await env.CHETAMBA.put(codeKey(code), String(chatId), { expirationTtl: 7 * 24 * 60 * 60 });
-    await env.CHETAMBA.put(groupKey(String(chatId)), msg.chat.title || "this group");
+    await env.CHETAMBA.put(groupKey(String(chatId)), msg.chat.title || t(lang, "bot.thisGroup"));
+
+    // Seed the board's language from whoever ran /register, then immediately offer the choice.
+    // A default beats a prompt nobody answers — without one the board would post in English
+    // to a room that just registered it in Russian.
+    const seeded = await groupLang(env, chatId);
+    const boardLang = isLang(seeded) && (await env.CHETAMBA.get(groupLangKey(String(chatId))))
+      ? seeded
+      : detectLang(fromLocale);
+    await env.CHETAMBA.put(groupLangKey(String(chatId)), boardLang);
+
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: [
-        "*This chat is now a leaderboard.*",
-        "",
-        `Open Chetamba → Profile → Join group, and paste: \`${code}\``,
-        "",
-        "_Code works for 7 days. Run /register again for a fresh one._",
-      ].join("\n"),
+      text: t(boardLang, "bot.registered", { code }),
       parse_mode: "Markdown",
     });
+    await askLanguage(chatId, boardLang, "glang", env);
     return;
   }
 
@@ -329,37 +408,75 @@ async function handleUpdate(update, env) {
     // In a group, show that group. In a DM, show the board you belong to.
     let groupId = isPrivate ? null : String(chatId);
     if (isPrivate) {
-      const me = msg.from && (await readUser(env, String(msg.from.id)));
+      const me = fromId && (await readUser(env, String(fromId)));
       groupId = me && me.groupId;
     }
     if (!groupId) {
-      await tg(env, "sendMessage", { chat_id: chatId, text: "You're not on a board yet. Run /register in your group chat to start one." });
+      await tg(env, "sendMessage", { chat_id: chatId, text: t(lang, "bot.notOnBoard") });
       return;
     }
+    // A DM shows the board in the reader's own language; the group's own posts use the
+    // board language. Same numbers either way — only the wording differs.
     const standings = await groupStandings(env, groupId, today);
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: boardMessage(standings, today, "🏆 Standings"),
+      text: boardMessage(standings, today, t(lang, "bot.standingsTitle"), lang),
       parse_mode: "Markdown",
     });
     return;
   }
 
   // Anything else. Keep it short — this fires on stray messages, so don't be chatty.
-  await sendOpenCard(chatId, isPrivate, "Not a command I know. /start opens the app, /help explains it.", env);
+  await sendOpenCard(chatId, isPrivate, t(lang, "bot.unknownCommand"), env, lang);
 }
 
-function openMarkup(isPrivate, env) {
+async function askLanguage(chatId, lang, prefix, env) {
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: t(lang, prefix === "glang" ? "bot.groupLangAsk" : "bot.langAsk"),
+    reply_markup: langKeyboard(prefix),
+  });
+}
+
+/**
+ * A tap on one of the language buttons.
+ *
+ * Telegram spins the button forever until answerCallbackQuery is called, so that goes out
+ * first and unconditionally — before any KV write that could fail and leave the tap hanging.
+ */
+async function handleLangChoice(cq, env) {
+  const data = String(cq.data || "");
+  const [prefix, choice] = data.split(":");
+  const chatId = cq.message && cq.message.chat && cq.message.chat.id;
+
+  await tg(env, "answerCallbackQuery", { callback_query_id: cq.id });
+  if (!chatId || !isLang(choice) || (prefix !== "lang" && prefix !== "glang")) return;
+
+  if (prefix === "glang") {
+    await env.CHETAMBA.put(groupLangKey(String(chatId)), choice);
+    await tg(env, "sendMessage", { chat_id: chatId, text: t(choice, "bot.groupLangSet") });
+    return;
+  }
+
+  const id = String(cq.from && cq.from.id);
+  if (!id) return;
+  const existing = (await readUser(env, id)) || emptyUser(id, cq.from.first_name);
+  await writeUser(env, { ...existing, lang: choice });
+  await tg(env, "sendMessage", { chat_id: chatId, text: t(choice, "bot.langSet") });
+}
+
+function openMarkup(isPrivate, env, lang = DEFAULT_LANG) {
   // web_app buttons only work in private chats. In groups Telegram rejects them, so fall
   // back to the plain direct link, which opens the same Mini App.
+  const text = t(lang, "bot.openButton");
   const button = isPrivate
-    ? { text: "🏋️ Open Chetamba", web_app: { url: env.MINI_APP_URL } }
-    : { text: "🏋️ Open Chetamba", url: env.DIRECT_LINK };
+    ? { text, web_app: { url: env.MINI_APP_URL } }
+    : { text, url: env.DIRECT_LINK };
   return { inline_keyboard: [[button]] };
 }
 
-async function sendOpenCard(chatId, isPrivate, body, env) {
-  const reply_markup = openMarkup(isPrivate, env);
+async function sendOpenCard(chatId, isPrivate, body, env, lang = DEFAULT_LANG) {
+  const reply_markup = openMarkup(isPrivate, env, lang);
 
   if (env.PREVIEW_IMAGE_URL) {
     const res = await tg(env, "sendPhoto", {

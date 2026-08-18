@@ -88,10 +88,14 @@ export const userKey = (id) => `user:${id}`;
 export const memberKey = (groupId, id) => `member:${groupId}:${id}`;
 export const codeKey = (code) => `joincode:${code}`;
 export const groupKey = (groupId) => `group:${groupId}`;
+// The language a group's posts are written in, chosen once at /register. Separate from the
+// group's title rather than packed in beside it, because the title is already stored as a
+// bare string and re-encoding it would break every group registered before this existed.
+export const groupLangKey = (groupId) => `grouplang:${groupId}`;
 
 // ---------- User records ----------
-export function emptyUser(id, name) {
-  return { id, name: name || "", groupId: null, strength: 800, ledger: [], updatedAt: null };
+export function emptyUser(id, name, lang = null) {
+  return { id, name: name || "", groupId: null, strength: 800, ledger: [], updatedAt: null, lang };
 }
 
 export async function readUser(env, id) {
@@ -112,6 +116,10 @@ export function applyPublish(user, payload, todayIso) {
   const next = { ...user };
   if (payload.name) next.name = String(payload.name).slice(0, 32);
   if (typeof payload.strength === "number") next.strength = Math.round(payload.strength);
+  // The app sends the language it is set to, so flipping the switch in the app also changes
+  // what the bot's private messages sound like. Validated rather than trusted — this comes
+  // off the network, and an unknown value would fall through to the key name on screen.
+  if (payload.lang === "en" || payload.lang === "ru") next.lang = payload.lang;
 
   const entry = {
     id: String(payload.sessionId || ""),
