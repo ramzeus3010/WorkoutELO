@@ -8,7 +8,7 @@
 import crypto from "node:crypto";
 import {
   verifyInitData, MAX_INITDATA_AGE_SEC,
-  emptyUser, applyPublish, standingFor, rankChange, makeJoinCode,
+  emptyUser, applyPublish, applySync, standingFor, rankChange, makeJoinCode,
 } from "../bot/relay.js";
 
 let failures = 0;
@@ -148,6 +148,69 @@ console.log("\njoin codes");
   check("ambiguous characters are excluded — these get typed off another phone",
     ![...codes].some((c) => /[01IO]/.test(c)));
 }
+
+// ---------------------------------------------------------------- applySync
+// The reconciling counterpart to applyPublish. Publishing is incremental and only fires when
+// a workout is finished, so a user who joined a group and typed /score read as a blank 800
+// while their app showed their real score — the two numbers are the same metric, and the bot
+// had simply never been told. This is what tells it.
+console.log("\napplySync");
+{
+  const u0 = emptyUser("7", "Ramazan");
+  check("a fresh user starts at the baseline", u0.strength === 800);
+
+  const synced = applySync(u0, {
+    strength: 1771,
+    name: "Ramazan",
+    lang: "ru",
+    ledger: [
+      { id: "s1", date: "2026-08-17", effort: 1.2, kind: "lift" },
+      { id: "s2", date: "2026-08-18", effort: 0.9, kind: "activity" },
+    ],
+  }, "2026-08-18");
+
+  check("the client's score replaces the stored one", synced.strength === 1771, String(synced.strength));
+  check("the ledger is replaced wholesale", synced.ledger.length === 2);
+  check("the language rides along", synced.lang === "ru");
+
+  // Replacement, not merge: a ledger that drifted because a publish was lost has to heal on
+  // the next app open, which an append-only design could never do.
+  const shrunk = applySync(synced, {
+    strength: 1800,
+    ledger: [{ id: "s2", date: "2026-08-18", effort: 0.9, kind: "activity" }],
+  }, "2026-08-18");
+  check("a shorter ledger replaces a longer one rather than merging", shrunk.ledger.length === 1);
+
+  // Everything below arrives over the network.
+  const hostile = applySync(u0, {
+    strength: 5000,
+    name: "x".repeat(500),
+    lang: "klingon",
+    ledger: [
+      { id: "a", date: "2026-08-18", effort: -50, kind: "lift" },
+      { id: "b", date: "1999-01-01", effort: 1, kind: "lift" },
+      { id: "c", date: "2026-08-18", effort: "nonsense", kind: "hacking" },
+    ],
+  }, "2026-08-18");
+  check("a hostile name is truncated", hostile.name.length <= 32);
+  check("an unknown language is ignored", hostile.lang === null, String(hostile.lang));
+  check("negative effort is floored at zero", hostile.ledger.every((e) => e.effort >= 0));
+  check("entries older than the retention window are dropped", !hostile.ledger.some((e) => e.date === "1999-01-01"));
+  check("an unknown kind falls back to lift", hostile.ledger.find((e) => e.id === "c").kind === "lift");
+  check("a non-numeric effort becomes zero", hostile.ledger.find((e) => e.id === "c").effort === 0);
+
+  const flood = applySync(u0, {
+    ledger: Array.from({ length: 5000 }, (_, i) => ({ id: `x${i}`, date: "2026-08-18", effort: 1, kind: "lift" })),
+  }, "2026-08-18");
+  check("an oversized ledger is capped", flood.ledger.length <= 400, String(flood.ledger.length));
+
+  // Omitted fields must not wipe state — a sync from a client that hasn't finished loading
+  // should be a no-op, not a reset to zero.
+  const partial = applySync(synced, {}, "2026-08-18");
+  check("an empty payload leaves the score intact", partial.strength === 1771);
+  check("an empty payload leaves the ledger intact", partial.ledger.length === 2);
+}
+
 
 if (failures > 0) {
   console.log(`\ntest-relay: ${failures} check(s) failed`);

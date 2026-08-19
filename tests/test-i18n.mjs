@@ -65,6 +65,51 @@ check("t() substitutes vars", t("en", "time.daysAgo", { n: 3, unit: "days" }) ==
 check("t() falls back to the key when unknown", t("en", "no.such.key") === "no.such.key");
 check("t() falls back to English for a missing ru key", t("ru", "no.such.key") === "no.such.key");
 
+// ---------- Length budgets for tight controls ----------
+// Russian runs 10-30% longer than English, and several of these labels sit in fixed-width
+// controls — a flex-1 button sharing its row with two 80px inputs, three equal-width range
+// buttons, a half-width button with an icon. Overflowing text there is a CSS failure, and
+// jsdom runs no CSS, so no rendering test can catch it. A character budget can.
+//
+// The budget is per key, measured from what actually fit on a 360px screen at the app's 18px
+// base font. Raising one means re-checking that control on a real phone.
+const BUDGETS = {
+  "log.addSet": 18,      // flex-1 beside two 80px inputs — the tightest control in the app
+  "exp.range.4w": 14,    // one of three equal-width buttons
+  "exp.range.12w": 14,
+  "exp.range.all": 14,
+  "board.share": 16,     // half width, with an icon
+  "board.addFriend": 18,
+  "log.swap": 10,        // small inline button on every exercise card
+  "log.form": 10,
+  "nav.log": 12,         // four across the bottom nav; a fifth tab would already wrap
+  "nav.history": 12,
+  "nav.progress": 12,
+  "nav.profile": 12,
+  "log.lift": 14,        // two-across toggle
+  "log.activity": 14,
+  "timer.start": 10,
+  "group.join": 10,      // sits beside a code input on one row
+  "common.cancel": 12,
+};
+
+const overBudget = [];
+Object.entries(BUDGETS).forEach(([key, max]) => {
+  LANG_IDS.forEach((lang) => {
+    const value = STRINGS[lang][key];
+    if (value === undefined) {
+      overBudget.push(`${key} [${lang}]: missing`);
+    } else if (value.length > max) {
+      overBudget.push(`${key} [${lang}]: ${value.length} > ${max} ("${value}")`);
+    }
+  });
+});
+check(
+  "labels in fixed-width controls stay within their budget",
+  overBudget.length === 0,
+  overBudget.join("\n       ")
+);
+
 // ---------- Russian plurals ----------
 // The rule that catches people out: 11-14 take the genitive plural despite ending in 1-4.
 const day = (n) => plural("ru", n, "unit.day");

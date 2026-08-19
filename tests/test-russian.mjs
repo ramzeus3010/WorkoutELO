@@ -6,8 +6,15 @@
 // storage. This drives the built bundle to check both.
 
 import {
-  BUNDLE, makeDom, sleep, buttonWithText, click, setNativeValue, rootText, check, finish,
+  BUNDLE, makeDom, sleep, waitFor, buttonWithText, click, setNativeValue, rootText, check, finish,
 } from "./dom.mjs";
+import { t } from "../src/i18n.js";
+
+// Buttons are located by their dictionary entry rather than by a copy-pasted literal. These
+// lookups are about behaviour, not wording — pinning the exact words here meant that
+// shortening a label to fit its button (a layout fix) broke a test that had no opinion about
+// the label at all. Assertions where the copy itself is the point still spell it out.
+const ru = (key, vars) => t("ru", key, vars);
 
 function boot({ lang = "ru", profile = { heightCm: 186, weightKg: 76, displayName: "Рамазан" }, extra = {} } = {}) {
   const dom = makeDom();
@@ -77,12 +84,12 @@ console.log("\nCyrillic exercise names");
   await sleep(800);
 
   // Add a one-off and give it a Russian name, the way someone at a gym actually would.
-  const addButton = buttonWithText(doc, "Добавить разовое упражнение");
+  const addButton = buttonWithText(doc, ru("log.addOneOff"));
   check("the add-exercise button is translated", !!addButton);
   click(w, addButton);
   await sleep(400);
 
-  const nameInput = [...doc.querySelectorAll("input")].find((i) => i.value === "Новое упражнение");
+  const nameInput = [...doc.querySelectorAll("input")].find((i) => i.value === ru("log.newExercise"));
   check("a new one-off is named in Russian", !!nameInput, [...doc.querySelectorAll("input")].map((i) => i.value).join(" | "));
 
   setNativeValue(w, nameInput, "Жим лёжа");
@@ -97,15 +104,15 @@ console.log("\nCyrillic exercise names");
   setNativeValue(w, weight, "60");
   setNativeValue(w, reps, "8");
   await sleep(300);
-  click(w, buttonWithText(card, "Добавить подход"));
-  await sleep(400);
+  click(w, buttonWithText(card, ru("log.addSet")));
 
-  check("a Cyrillic-named exercise accepts sets", rootText(w).includes("Подх. 1"), rootText(w).slice(0, 300));
+  const logged = await waitFor(() => rootText(w).includes(ru("log.setN", { n: 1 })));
+  check("a Cyrillic-named exercise accepts sets", logged, rootText(w).slice(0, 300));
   check("the Cyrillic name survives on screen", rootText(w).includes("Жим лёжа"));
   check("no console errors with Cyrillic input", errs.length === 0, errs.join("\n"));
 
-  click(w, buttonWithText(doc, "Сохранить тренировку"));
-  await sleep(900);
+  click(w, buttonWithText(doc, ru("log.save")));
+  await waitFor(() => Object.keys(w.localStorage).some((k) => k.startsWith("sess_") && k !== "sess_index"));
 
   // The stored session is what the bug destroyed: ids derived from a Cyrillic name all
   // collapsed to "x", so two Russian exercises became indistinguishable in storage.
@@ -174,7 +181,7 @@ console.log("\nthe coach reads Russian pain notes");
   });
   await sleep(900);
 
-  const start = buttonWithText(doc, "Начать тренировку");
+  const start = buttonWithText(doc, ru("coach.start"));
   check("the coach button is translated", !!start, rootText(w).slice(0, 200));
   click(w, start);
   await sleep(600);

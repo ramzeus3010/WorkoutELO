@@ -13,6 +13,11 @@ APP_ORIGIN = "https://ramzeus3010.github.io"
 # Optional: an https image URL to show as a card above the /start message.
 # PREVIEW_IMAGE_URL = "https://ramzeus3010.github.io/WorkoutELO/dist/preview.png"
 
+# Optional: which model writes generated programs. Defaults to gpt-4o. Whatever you pick must
+# support structured outputs (response_format: json_schema) — not every model does. The key
+# itself is a SECRET, not a var: `wrangler secret put OPENAI_API_KEY`.
+# OPENAI_MODEL = "gpt-4o"
+
 # The group leaderboard's only server-side state: display name, Telegram id, published
 # scores, and which group you belong to. NOT workout data — that stays in CloudStorage on
 # each user's own account. /score needs this because when someone types it in the group, no

@@ -535,6 +535,41 @@ async function relay(path, body) {
   }
 }
 
+/**
+ * Everything the relay needs to reproduce this user's standings from scratch.
+ *
+ * The ledger stores INPUTS (dated efforts), never the finished weekly total — effort decays
+ * and resets on Mondays, so a cached total is right for a few hours and then quietly wrong,
+ * and /score is answered when no client is running to correct it.
+ */
+function syncPayload(sessions, profile, program, lang) {
+  const asOf = leagueTodayISO();
+  const all = hydratePatterns(sessions || [], program);
+  const cutoff = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+  return {
+    strength: strengthScore(all, Number(profile.weightKg) || null, asOf).score,
+    name: profile.displayName || "",
+    lang: lang || DEFAULT_LANG,
+    ledger: all
+      .filter((s) => s.date >= cutoff)
+      .map((s) => ({ id: s.id, date: s.date, effort: sessionEffort(s), kind: s.kind || "lift" })),
+  };
+}
+
+/**
+ * Push the local score to the relay on app open.
+ *
+ * Without this, `user.strength` on the Worker only moved when a workout was published, so
+ * someone who joined a group and typed /score read as a blank 800 — the app said 1771 and the
+ * chat said 800, which reads as two different scoring systems rather than one stale copy.
+ * Fire-and-forget: this is a correction, and failing to send it must never surface as an error.
+ */
+function syncScore(sessions, profile, program, lang) {
+  if (!initData()) return;
+  if (!Number(profile.weightKg)) return; // nothing meaningful to send yet
+  relay("/api/sync", syncPayload(sessions, profile, program, lang));
+}
+
 // Fire-and-forget by design. The session is already saved to CloudStorage by the time this
 // runs, so a failed publish must never surface as a failed workout — the worst case is the
 // group misses one message, and the next publish carries the updated totals anyway.
@@ -721,7 +756,8 @@ export default function App() {
       const storedLang = await cloud.get(LANG_KEY);
       if (isLang(storedLang)) setLang(storedLang);
       setOnboarded((await cloud.get(ONBOARDED_KEY)) === "1");
-      setProgram(await loadProgram());
+      const prog = await loadProgram();
+      setProgram(prog);
       const loaded = await loadAllSessions();
       setSessions(loaded);
       const raw = await cloud.get(PROFILE_KEY);
@@ -732,6 +768,10 @@ export default function App() {
         p.displayName = TG.initDataUnsafe.user.first_name || "";
       }
       setProfile(p);
+
+      // Reconcile the relay's copy of the score with this device's. Last, so it sees the
+      // fully-loaded state, and unawaited so a slow network never delays the first paint.
+      syncScore(loaded, p, prog, isLang(storedLang) ? storedLang : lang);
     })();
   }, []);
 
@@ -865,6 +905,7 @@ export default function App() {
             {tab === "program" && (
               <ProgramEditor
                 program={program}
+                profile={profile}
                 onCommit={commitProgram}
                 onReset={restoreDefaultProgram}
                 onBack={() => setTab("profile")}
@@ -1493,9 +1534,9 @@ function CoachPanel({ analysis, onStart }) {
     return (
       <button
         onClick={onStart}
-        className="w-full mb-5 flex items-center justify-center gap-2 rounded-xl border border-dashed border-maroon-300 bg-maroon-50 text-maroon-700 text-sm font-semibold py-3"
+        className="w-full mb-5 flex items-center justify-center gap-2 px-3 rounded-xl border border-dashed border-maroon-300 bg-maroon-50 text-maroon-700 text-sm font-semibold leading-tight text-center py-3"
       >
-        <Sparkles size={15} /> {t("coach.start")}
+        <Sparkles size={15} className="shrink-0" /> {t("coach.start")}
       </button>
     );
   }
@@ -2495,11 +2536,15 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
               className="w-20 bg-white rounded-md px-2 py-2 text-base text-center font-mono border border-gray-200 focus:outline-none focus:ring-2 focus:ring-maroon-600"
               onKeyDown={(e) => e.key === "Enter" && addSet()}
             />
+            {/* min-w-0 + leading-tight because this button shares its row with two 80px
+                inputs and gets whatever is left. Russian labels run longer than English, and
+                without these a long label pushes its own text past the button edge rather
+                than wrapping inside it. The icon needs shrink-0 or it gets squashed first. */}
             <button
               onClick={addSet}
-              className="flex-1 flex items-center justify-center gap-1 bg-gray-100 rounded-md text-sm font-semibold text-gray-900 hover:bg-gray-200 transition-colors"
+              className="flex-1 min-w-0 flex items-center justify-center gap-1 px-1 bg-gray-100 rounded-md text-sm font-semibold leading-tight text-center text-gray-900 hover:bg-gray-200 transition-colors"
             >
-              <Plus size={15} /> {t("log.addSet")}
+              <Plus size={15} className="shrink-0" /> {t("log.addSet")}
             </button>
           </div>
 
@@ -2655,7 +2700,7 @@ function HistoryView({ sessions, onDelete }) {
 // ---------- Profile View ----------
 // Joining the group board. The code comes from /register in the group chat — a code rather
 // than a link because it has to survive being read off one phone and typed into another.
-function GroupJoin() {
+function GroupJoin({ sessions, profile, program, lang }) {
   const t = useT();
   const [code, setCode] = useState("");
   const [state, setState] = useState({ status: "idle" }); // idle | working | joined | error
@@ -2670,7 +2715,12 @@ function GroupJoin() {
 
   async function submit() {
     setState({ status: "working" });
-    const res = await relay("/api/join", { code: code.trim().toUpperCase() });
+    // The score rides along with the join, so the group sees the real number immediately
+    // rather than a placeholder 800 until this user's next finished workout.
+    const res = await relay("/api/join", {
+      code: code.trim().toUpperCase(),
+      ...syncPayload(sessions, profile, program, lang),
+    });
     if (res && res.ok) {
       const title = res.groupTitle || t("group.yourGroup");
       await cloud.set(GROUP_KEY, title);
@@ -2832,7 +2882,7 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram, lang, 
         </button>
       </div>
 
-      <GroupJoin />
+      <GroupJoin sessions={sessions} profile={profile} program={program} lang={lang} />
 
       <ExportPanel sessions={sessions} profile={profile} program={program} />
 
@@ -2851,7 +2901,190 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram, lang, 
 //
 // Edits are held locally and written on Save, so a half-finished reshuffle never reaches
 // storage — and so one write covers a whole editing session rather than one per keystroke.
-function ProgramEditor({ program, onCommit, onReset, onBack }) {
+/**
+ * Turn a generated program into the app's own program shape.
+ *
+ * Ids are derived from names via slugId, exactly like a template — which is why slugId had to
+ * learn about non-Latin alphabets first: a Russian-language generation produces Russian day
+ * names, and under the old implementation every one of them collapsed to the id "x" and
+ * overwrote the previous day.
+ *
+ * Day ids are de-duplicated because nothing stops the model naming two days the same thing.
+ */
+function programFromGenerated(generated) {
+  const days = [];
+  const exercisesByDay = {};
+  const seen = new Set();
+
+  (generated.days || []).forEach((d, i) => {
+    let id = slugId(d.name);
+    while (seen.has(id)) id = `${slugId(d.name)}-${i}`;
+    seen.add(id);
+
+    days.push({ id, name: d.name, subtitle: d.subtitle || "" });
+    const usedEx = new Set();
+    exercisesByDay[id] = (d.exercises || []).map((e, j) => {
+      let exId = slugId(e.name);
+      while (usedEx.has(exId)) exId = `${slugId(e.name)}-${j}`;
+      usedEx.add(exId);
+      return {
+        id: exId,
+        name: e.name,
+        muscle: "",
+        target: e.target || "",
+        rest: Math.min(300, Math.max(30, Number(e.rest) || DEFAULT_REST)),
+        link: "",
+        pattern: e.pattern,
+        meta: metaFromPattern(e.pattern),
+      };
+    });
+  });
+
+  return withMetaIndex({ version: 1, days, exercisesByDay });
+}
+
+/**
+ * Describe a program in plain text, get one back.
+ *
+ * Nothing is saved automatically. The generated program is loaded into the editor's draft as
+ * an unsaved change, so the user reviews it in the same UI they'd edit it in and still has to
+ * press Save — the model's output is a proposal, never a commit. That's the whole reason this
+ * lives inside the editor rather than being its own screen.
+ */
+function AiProgramPanel({ profile, lang, onAccept }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const [prompt, setPrompt] = useState("");
+  const [state, setState] = useState({ status: "idle" }); // idle | working | preview | error
+  const [result, setResult] = useState(null);
+
+  const canSend = prompt.trim().length >= 10 && state.status !== "working";
+
+  async function generate() {
+    setState({ status: "working" });
+    const res = await relay("/api/program", {
+      prompt: prompt.trim(),
+      profile: { weightKg: profile.weightKg, heightCm: profile.heightCm },
+    });
+    if (res && res.ok && res.program) {
+      setResult(res.program);
+      setState({ status: "preview" });
+    } else {
+      // The Worker returns a translation key, not prose, so the message renders in whatever
+      // language the app is set to rather than whatever the Worker guessed.
+      const key = (res && res.reason) || "ai.errNetwork";
+      setState({ status: "error", message: t(key) });
+    }
+  }
+
+  function accept() {
+    onAccept(programFromGenerated(result));
+    setResult(null);
+    setPrompt("");
+    setState({ status: "idle" });
+    setOpen(false);
+  }
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className="w-full mb-4 flex items-center justify-center gap-2 rounded-xl border border-dashed border-maroon-300 bg-maroon-50 text-maroon-700 text-sm font-semibold py-3"
+      >
+        <Sparkles size={15} /> {t("ai.open")}
+      </button>
+    );
+  }
+
+  return (
+    <div className="mb-4 rounded-xl border border-maroon-200 bg-maroon-50 px-4 py-3.5">
+      <div className="flex items-center gap-1.5 mb-2">
+        <Sparkles size={14} className="text-maroon-600" />
+        <p className="text-sm font-semibold text-maroon-800">{t("ai.title")}</p>
+      </div>
+
+      {state.status === "preview" && result ? (
+        <>
+          <p className="text-sm font-semibold mb-0.5">{result.name}</p>
+          <p className="text-xs text-gray-600 mb-2 leading-snug">{result.summary}</p>
+
+          {result.exclusions && result.exclusions.length > 0 && (
+            <p className="text-xs text-gray-500 mb-2 leading-snug">
+              {t("ai.excluded")}: {result.exclusions.join(", ")}
+            </p>
+          )}
+
+          <div className="space-y-2 mb-3 max-h-72 overflow-y-auto">
+            {result.days.map((d, i) => (
+              <div key={i} className="rounded-lg bg-white border border-gray-200 px-2.5 py-2">
+                <p className="text-xs font-semibold">{d.name}</p>
+                {d.subtitle && <p className="text-xs text-gray-500 leading-snug">{d.subtitle}</p>}
+                <ul className="mt-1 space-y-0.5">
+                  {d.exercises.map((e, j) => (
+                    <li key={j} className="text-xs text-gray-700 leading-snug">
+                      {e.name} <span className="text-gray-400">· {e.target} · {t(`pat.${e.pattern}`)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+
+          <p className="text-xs text-gray-500 mb-2 leading-snug">{t("ai.reviewNote")}</p>
+          <div className="flex gap-1.5">
+            <button onClick={accept} className="flex-1 bg-maroon-600 text-white text-sm font-semibold rounded-md py-2">
+              {t("ai.use")}
+            </button>
+            <button
+              onClick={() => setState({ status: "idle" })}
+              className="flex-1 bg-white border border-gray-200 text-gray-600 text-sm font-semibold rounded-md py-2"
+            >
+              {t("ai.tryAgain")}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <p className="text-xs text-gray-600 mb-2 leading-snug">{t("ai.explain")}</p>
+          <textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder={t("ai.placeholder")}
+            rows={4}
+            className="w-full resize-none bg-white rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
+          />
+          {state.status === "error" && (
+            <p className="text-xs text-maroon-700 mt-1.5 leading-snug">{state.message}</p>
+          )}
+          <div className="flex gap-1.5 mt-2">
+            <button
+              onClick={generate}
+              disabled={!canSend}
+              className={`flex-1 flex items-center justify-center gap-1.5 text-sm font-semibold rounded-md py-2 ${
+                canSend ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-400"
+              }`}
+            >
+              {state.status === "working" ? (
+                <><Loader2 size={14} className="animate-spin" /> {t("ai.working")}</>
+              ) : (
+                <>{t("ai.generate")}</>
+              )}
+            </button>
+            <button
+              onClick={() => { setOpen(false); setState({ status: "idle" }); }}
+              className="px-3 bg-white border border-gray-200 text-gray-600 text-sm font-semibold rounded-md py-2"
+            >
+              {t("common.cancel")}
+            </button>
+          </div>
+          <p className="text-xs text-gray-400 mt-1.5 leading-snug">{t("ai.slowNote")}</p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ProgramEditor({ program, profile, onCommit, onReset, onBack }) {
   const t = useT();
   const lang = useLang();
   const dayName = useDayName();
@@ -2939,6 +3172,15 @@ function ProgramEditor({ program, onCommit, onReset, onBack }) {
 
       <h2 className="text-2xl font-bold tracking-tight mb-1">{t("prog.title")}</h2>
       <p className="text-sm text-gray-500 mb-4 leading-snug">{t("prog.explain")}</p>
+
+      <AiProgramPanel
+        profile={profile}
+        lang={lang}
+        onAccept={(generated) => {
+          setDraft(generated);
+          setOpenDayId(generated.days[0] ? generated.days[0].id : null);
+        }}
+      />
 
       <div className="space-y-2.5">
         {draft.days.map((d) => {
@@ -3338,7 +3580,7 @@ function ExportPanel({ sessions, profile, program }) {
           <button
             key={r.id}
             onClick={() => { setRangeId(r.id); setFallback(""); }}
-            className={`flex-1 text-sm font-semibold rounded-md py-2 ${
+            className={`flex-1 min-w-0 px-1 text-sm font-semibold leading-tight rounded-md py-2 ${
               rangeId === r.id ? "bg-maroon-600 text-white" : "bg-white text-gray-500 border border-gray-200"
             }`}
           >
@@ -3591,15 +3833,15 @@ function Leaderboard({ displayName, rating, tierName }) {
       <div className="flex gap-1.5">
         <button
           onClick={shareCard}
-          className="flex-1 flex items-center justify-center gap-1.5 bg-maroon-600 text-white text-xs font-semibold rounded-md py-2"
+          className="flex-1 min-w-0 flex items-center justify-center gap-1.5 px-1 bg-maroon-600 text-white text-xs font-semibold leading-tight text-center rounded-md py-2"
         >
-          <Share2 size={12} /> {copied ? t("board.copied") : t("board.share")}
+          <Share2 size={12} className="shrink-0" /> {copied ? t("board.copied") : t("board.share")}
         </button>
         <button
           onClick={() => setPasteOpen((v) => !v)}
-          className="flex-1 flex items-center justify-center gap-1.5 bg-white border border-gray-200 text-gray-700 text-xs font-semibold rounded-md py-2"
+          className="flex-1 min-w-0 flex items-center justify-center gap-1.5 px-1 bg-white border border-gray-200 text-gray-700 text-xs font-semibold leading-tight text-center rounded-md py-2"
         >
-          <Plus size={12} /> {t("board.addFriend")}
+          <Plus size={12} className="shrink-0" /> {t("board.addFriend")}
         </button>
       </div>
 

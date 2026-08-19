@@ -21,14 +21,15 @@
  */
 
 import {
-  verifyInitData, readUser, writeUser, emptyUser, applyPublish,
-  standingFor, groupStandings, rankChange, makeJoinCode,
+  verifyInitData, readUser, writeUser, emptyUser, applyPublish, applySync,
+  standingFor, groupStandings, makeJoinCode,
   codeKey, memberKey, groupKey, groupLangKey, leagueTodayISO, weekStartISO,
 } from "./relay.js";
 // The same dictionary the Mini App renders from. Shared for the same reason scoring.js is:
 // the bot and the app describe the same events to the same people, and two copies of the
 // wording would drift until the group chat and the app disagreed.
 import { t, plural, detectLang, isLang, LANGS, DEFAULT_LANG } from "../src/i18n.js";
+import { generateProgram } from "./program-ai.js";
 
 // Cron expressions are UTC; the league runs on UTC+5 (Almaty). Monday 08:00 and Sunday 19:00
 // local. These must match wrangler.toml exactly — runCron() compares the string, so a typo
@@ -174,23 +175,21 @@ async function handleApi(pathname, request, env) {
     if (existing.groupId && existing.groupId !== groupId) {
       await env.CHETAMBA.delete(memberKey(existing.groupId, caller.id));
     }
-    const joined = { ...existing, groupId, name: body.name || existing.name || caller.firstName, lang };
+    // Sync first, so someone who joins mid-season appears at their real score rather than at
+    // a blank 800 until their next workout.
+    const synced = applySync(existing, body, today);
+    const joined = { ...synced, groupId, name: body.name || synced.name || caller.firstName, lang };
     await writeUser(env, joined);
     await env.CHETAMBA.put(memberKey(groupId, caller.id), "1");
 
     const title = (await env.CHETAMBA.get(groupKey(groupId))) || t(lang, "bot.groupFallback");
     // Announced in the GROUP's language, not the joiner's — everyone in the chat reads it.
     const gl = await groupLang(env, groupId);
-    await tg(env, "sendMessage", {
-      chat_id: groupId,
-      text: t(gl, "bot.joinedBoard", { name: escapeMd(joined.name) }),
-      parse_mode: "Markdown",
-    });
+    await say(env, groupId, t(gl, "bot.joinedBoard", { name: escapeMd(joined.name) }), { lang: gl });
     return json(env, { ok: true, groupTitle: title });
   }
 
   if (pathname === "/api/publish") {
-    const before = existing.groupId ? await groupStandings(env, existing.groupId, today) : [];
     const updated = applyPublish(existing, body, today);
     await writeUser(env, updated);
 
@@ -198,15 +197,34 @@ async function handleApi(pathname, request, env) {
     if (!updated.groupId) return json(env, { ok: true, posted: false, standing: standingFor(updated, today) });
 
     const after = await groupStandings(env, updated.groupId, today);
-    const moved = rankChange(before, after, caller.id);
     const gl = await groupLang(env, updated.groupId);
-    await tg(env, "sendMessage", {
-      chat_id: updated.groupId,
-      text: finishedMessage(updated, body, standingFor(updated, today), moved, gl),
-      parse_mode: "Markdown",
-      disable_web_page_preview: true,
-    });
+    await say(env, updated.groupId, finishedMessage(updated, body, after, today, gl), { lang: gl });
     return json(env, { ok: true, posted: true, standing: standingFor(updated, today) });
+  }
+
+  // Reconcile the Worker's copy with the client's. Called on app open, so the board is
+  // correct even for someone who hasn't finished a workout since joining. Deliberately does
+  // NOT announce anything to the group — this is a correction, not an event.
+  if (pathname === "/api/sync") {
+    const updated = applySync(existing, body, today);
+    await writeUser(env, updated);
+    return json(env, { ok: true, standing: standingFor(updated, today) });
+  }
+
+  // AI program generation. The only endpoint that costs real money per call, which is why
+  // identity is verified above and the generator rate-limits per user.
+  if (pathname === "/api/program") {
+    const result = await generateProgram(env, {
+      prompt: body.prompt,
+      lang,
+      profile: body.profile,
+      userId: caller.id,
+      todayIso: today,
+    });
+    // A failed generation is a 200 with ok:false — the client renders `reason` as a
+    // translated message. A non-2xx here would be indistinguishable from the network errors
+    // relay() already swallows.
+    return json(env, result);
   }
 
   if (pathname === "/api/me") {
@@ -243,7 +261,84 @@ function sessionLabel(payload, lang) {
   return t(lang, payload.kind === "activity" ? "bot.anActivity" : "bot.aWorkout");
 }
 
-function finishedMessage(user, payload, standing, moved, lang) {
+/**
+ * The standings, as an aligned table.
+ *
+ * Telegram has no table syntax, so the columns are held in place by a fenced code block —
+ * monospace is the only alignment guarantee across iOS, Android and desktop. Two consequences
+ * shape everything below:
+ *
+ *   1. **No emoji inside the block.** Medals render at variable width in a monospace face and
+ *      knock every following column out of line, which is worse than having no medals. They
+ *      go in the title instead.
+ *   2. **No markdown inside the block**, so names can't be bolded — but they also can't break
+ *      the message, since a `*` in a name is literal here rather than syntax. Backticks still
+ *      have to go, because they would close the fence.
+ *
+ * Columns are Rating and this week's effort — the same two numbers the app shows, under the
+ * same names. The board is RANKED on the 40/60 combination of them, which is why the footer
+ * says so: a ranking you can't derive from the visible columns otherwise looks arbitrary.
+ */
+const stripFence = (s) => String(s == null ? "" : s).replace(/[`\n]/g, "");
+
+function truncName(name, width) {
+  const clean = stripFence(name).trim() || "—";
+  return clean.length > width ? `${clean.slice(0, width - 1)}…` : clean;
+}
+
+// Column widths, in monospace characters. The row prefix is marker(1) + rank(2) + space(1),
+// so the header is indented by exactly RANK_W to line up — an off-by-one here shifts every
+// heading one column left of its numbers, which looks like a bug in the scores rather than in
+// the padding. The rank is padded to two digits so a group of ten or more doesn't drift.
+// Total width is 29 characters, which fits a narrow phone without wrapping; widening the name
+// column is what breaks that first.
+const RANK_W = 4;
+const NAME_W = 10;
+const RATING_W = 8;
+const WEEK_W = 7;
+
+function standingsTable(standings, lang, highlightId) {
+  const head =
+    " ".repeat(RANK_W) +
+    t(lang, "bot.colName").padEnd(NAME_W) +
+    t(lang, "bot.colRating").padStart(RATING_W) +
+    t(lang, "bot.colWeek").padStart(WEEK_W);
+
+  const rows = standings.map((s, i) => {
+    // A marker rather than bold, since markdown is inert inside the fence.
+    const mark = s.id === highlightId ? "▸" : " ";
+    return (
+      mark +
+      String(i + 1).padStart(2) +
+      " " +
+      truncName(s.name, NAME_W).padEnd(NAME_W) +
+      String(s.strength).padStart(RATING_W) +
+      s.effort.toFixed(1).padStart(WEEK_W)
+    );
+  });
+
+  return ["```", head, ...rows, "```"].join("\n");
+}
+
+function boardMessage(standings, asOfIso, title, lang, highlightId) {
+  if (standings.length === 0) return t(lang, "bot.emptyBoard");
+  return [
+    `*${title}*`,
+    t(lang, "bot.weekOf", { date: weekStartISO(asOfIso) }),
+    standingsTable(standings, lang, highlightId),
+    t(lang, "bot.rankedBy"),
+  ].join("\n");
+}
+
+/**
+ * Posted when someone finishes a workout: one headline line, then the standings.
+ *
+ * This replaced a prose summary that narrated movement ("Up to #2, past Daniyar") — which
+ * read oddly in a group chat, and buried the numbers people actually wanted. The table shows
+ * the same movement without anyone having to parse a sentence, and it shows it for everyone
+ * rather than only for whoever just finished.
+ */
+function finishedMessage(user, payload, standings, asOfIso, lang) {
   const lines = [];
   const label = escapeMd(sessionLabel(payload, lang));
   if (payload.kind === "activity") {
@@ -255,36 +350,9 @@ function finishedMessage(user, payload, standing, moved, lang) {
     const names = (payload.exercises || []).slice(0, 6).map(escapeMd);
     if (names.length) lines.push(`_${names.join(" · ")}_`);
   }
-  lines.push("");
-  lines.push(t(lang, "bot.strengthLine", {
-    strength: standing.strength,
-    effort: standing.effort.toFixed(1),
-    sessions: standing.sessions,
-    unit: plural(lang, standing.sessions, "unit.session"),
-  }));
-  if (moved) {
-    lines.push(t(lang, "bot.movedUp", {
-      rank: moved.to,
-      passed: moved.passed.map(escapeMd).join(t(lang, "bot.and")),
-    }));
-  }
+  lines.push(standingsTable(standings, lang, user.id));
+  lines.push(t(lang, "bot.rankedBy"));
   return lines.join("\n");
-}
-
-function boardMessage(standings, asOfIso, title, lang) {
-  if (standings.length === 0) return t(lang, "bot.emptyBoard");
-  const medal = ["🥇", "🥈", "🥉"];
-  const rows = standings.map((s, i) =>
-    `${medal[i] || `${i + 1}.`} *${escapeMd(s.name)}* — ${s.total.toFixed(1)}  _(str ${s.strength} · eff ${s.effort.toFixed(1)})_`
-  );
-  return [
-    `*${title}*`,
-    t(lang, "bot.weekOf", { date: weekStartISO(asOfIso) }),
-    "",
-    ...rows,
-    "",
-    t(lang, "bot.asOf"),
-  ].join("\n");
 }
 
 // ---------- Cron ----------
@@ -306,25 +374,19 @@ async function runCron(cron, env) {
 
     // Sunday evening: the deadline nudge, while there's still time to act on it.
     if (cron === SUNDAY_CRON) {
-      await tg(env, "sendMessage", {
-        chat_id: groupId,
-        text: boardMessage(standings, today, t(lang, "bot.finalHours"), lang),
-        parse_mode: "Markdown",
-      });
+      await say(env, groupId, boardMessage(standings, today, t(lang, "bot.finalHours"), lang), { lang });
       continue;
     }
 
-    // Monday: name last week's winner, then everyone's effort is back to zero.
+    // Monday: last week's final table, then everyone's effort is back to zero. The table is
+    // included because this is the last moment the finished week is visible — after this post
+    // the effort column resets and the standings people were racing are gone.
     const winner = standings[0];
-    await tg(env, "sendMessage", {
-      chat_id: groupId,
-      text: [
-        t(lang, "bot.newWeek"),
-        "",
-        t(lang, "bot.lastWeekWinner", { name: escapeMd(winner.name), total: winner.total.toFixed(1) }),
-      ].join("\n"),
-      parse_mode: "Markdown",
-    });
+    await say(env, groupId, [
+      t(lang, "bot.newWeek"),
+      t(lang, "bot.lastWeekWinner", { name: escapeMd(winner.name), total: winner.total.toFixed(1) }),
+      standingsTable(standings, lang, null),
+    ].join("\n"), { lang });
   }
 }
 
@@ -377,7 +439,7 @@ async function handleUpdate(update, env) {
   // fresh code each time is deliberate: it's how you re-invite people without any admin UI.
   if (command === "register") {
     if (isPrivate) {
-      await tg(env, "sendMessage", { chat_id: chatId, text: t(lang, "bot.registerInGroup") });
+      await say(env, chatId, t(lang, "bot.registerInGroup"), { isPrivate, lang });
       return;
     }
     const code = makeJoinCode();
@@ -394,11 +456,7 @@ async function handleUpdate(update, env) {
       : detectLang(fromLocale);
     await env.CHETAMBA.put(groupLangKey(String(chatId)), boardLang);
 
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: t(boardLang, "bot.registered", { code }),
-      parse_mode: "Markdown",
-    });
+    await say(env, chatId, t(boardLang, "bot.registered", { code }), { lang: boardLang });
     await askLanguage(chatId, boardLang, "glang", env);
     return;
   }
@@ -412,17 +470,13 @@ async function handleUpdate(update, env) {
       groupId = me && me.groupId;
     }
     if (!groupId) {
-      await tg(env, "sendMessage", { chat_id: chatId, text: t(lang, "bot.notOnBoard") });
+      await say(env, chatId, t(lang, "bot.notOnBoard"), { isPrivate, lang });
       return;
     }
     // A DM shows the board in the reader's own language; the group's own posts use the
     // board language. Same numbers either way — only the wording differs.
     const standings = await groupStandings(env, groupId, today);
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: boardMessage(standings, today, t(lang, "bot.standingsTitle"), lang),
-      parse_mode: "Markdown",
-    });
+    await say(env, chatId, boardMessage(standings, today, t(lang, "bot.standingsTitle"), lang, isPrivate ? String(fromId) : null), { isPrivate, lang });
     return;
   }
 
@@ -454,7 +508,7 @@ async function handleLangChoice(cq, env) {
 
   if (prefix === "glang") {
     await env.CHETAMBA.put(groupLangKey(String(chatId)), choice);
-    await tg(env, "sendMessage", { chat_id: chatId, text: t(choice, "bot.groupLangSet") });
+    await say(env, chatId, t(choice, "bot.groupLangSet"), { lang: choice });
     return;
   }
 
@@ -462,7 +516,7 @@ async function handleLangChoice(cq, env) {
   if (!id) return;
   const existing = (await readUser(env, id)) || emptyUser(id, cq.from.first_name);
   await writeUser(env, { ...existing, lang: choice });
-  await tg(env, "sendMessage", { chat_id: chatId, text: t(choice, "bot.langSet") });
+  await say(env, chatId, t(choice, "bot.langSet"), { isPrivate: true, lang: choice });
 }
 
 function openMarkup(isPrivate, env, lang = DEFAULT_LANG) {
@@ -497,6 +551,28 @@ async function sendOpenCard(chatId, isPrivate, body, env, lang = DEFAULT_LANG) {
     parse_mode: "Markdown",
     disable_web_page_preview: true,
     reply_markup,
+  });
+}
+
+/**
+ * Send a message with the Open Chetamba button attached.
+ *
+ * Every outbound message goes through here rather than calling `tg("sendMessage")` directly,
+ * because "attach the button" is the kind of rule that decays one forgotten call site at a
+ * time. The one deliberate exception is the language prompt, which carries its own keyboard —
+ * Telegram allows only one `reply_markup` per message.
+ *
+ * `isPrivate` picks the button variant: `web_app` buttons are rejected outside private chats,
+ * and a rejected button fails the whole message rather than degrading, so a group must get the
+ * plain-link form.
+ */
+async function say(env, chatId, text, { isPrivate = false, lang = DEFAULT_LANG, markdown = true } = {}) {
+  return tg(env, "sendMessage", {
+    chat_id: chatId,
+    text,
+    ...(markdown ? { parse_mode: "Markdown" } : {}),
+    disable_web_page_preview: true,
+    reply_markup: openMarkup(isPrivate, env, lang),
   });
 }
 

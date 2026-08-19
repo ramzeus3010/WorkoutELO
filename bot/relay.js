@@ -136,6 +136,45 @@ export function applyPublish(user, payload, todayIso) {
   return next;
 }
 
+/**
+ * Replace a user's score and ledger wholesale from the client.
+ *
+ * WHY THIS EXISTS ALONGSIDE applyPublish
+ * `applyPublish` only fires when a workout is finished, so a user who joined a group and then
+ * typed /score read as a blank 800 until their next session — their real score existed only in
+ * CloudStorage on their phone. Publishing is incremental by design (idempotent, fire-and-
+ * forget); this is the reconciling counterpart, sent on join and on app open.
+ *
+ * The client is the authority on its own history, so this REPLACES rather than merges. That
+ * also self-heals a ledger that drifted because a publish was lost — the next app open fixes
+ * it, where an append-only design would stay wrong forever.
+ */
+export function applySync(user, payload, todayIso) {
+  const next = { ...user };
+  if (payload.name) next.name = String(payload.name).slice(0, 32);
+  if (typeof payload.strength === "number") next.strength = Math.round(payload.strength);
+  if (payload.lang === "en" || payload.lang === "ru") next.lang = payload.lang;
+
+  if (Array.isArray(payload.ledger)) {
+    const cutoff = new Date(Date.parse(todayIso + "T00:00:00Z") - LEDGER_KEEP_DAYS * 86400000)
+      .toISOString().slice(0, 10);
+    // Bounded and sanitised: this is network input, and an unbounded array would be a way to
+    // grow one KV value without limit.
+    next.ledger = payload.ledger
+      .slice(0, 400)
+      .map((e) => ({
+        id: String(e.id || ""),
+        date: String(e.date || todayIso).slice(0, 10),
+        effort: Math.max(0, Number(e.effort) || 0),
+        kind: e.kind === "activity" ? "activity" : "lift",
+      }))
+      .filter((e) => e.date >= cutoff);
+  }
+
+  next.updatedAt = todayIso;
+  return next;
+}
+
 /** The two columns plus the combined total, recomputed as of `asOfIso`. */
 export function standingFor(user, asOfIso) {
   const week = weeklyEffort(user.ledger || [], asOfIso, (e) => e.effort);

@@ -1,7 +1,7 @@
 # Chetamba — state of the project
 
 *A briefing document, written to be pasted into a fresh conversation. Assumes no prior
-context. Last updated 2026-08-18 15:29.*
+context. Last updated 2026-08-19 09:23.*
 
 There is a much longer engineering handover doc in the repo (`workout_tracker.md`, ~670
 lines). This one is the strategic summary: what exists, what it cost to learn, what's
@@ -58,7 +58,7 @@ Original constraints, still shaping the app:
 
 | Area | Status |
 |---|---|
-| App code | Built, **12** automated test suites passing |
+| App code | Built, **13** automated test suites passing |
 | GitHub Pages hosting | **Live** |
 | Mini App registered with BotFather | **Yes** |
 | Bot Worker deployed and answering | **Yes** — URL confirmed 2026-08-18 |
@@ -66,7 +66,8 @@ Original constraints, still shaping the app:
 | English + Russian, app and bot (`src/i18n.js`) | **Built and tested** |
 | Onboarding, activities, program templates | **Done** |
 | Bot: KV, `/score`, publish-on-finish, crons | **Written and tested** |
-| Bot: the bilingual version | **NOT YET DEPLOYED — see §8** |
+| AI program generation (`bot/program-ai.js`) | **Built and tested — needs an API key (§8)** |
+| **Everything since the last deploy** | **NOT DEPLOYED — see §8** |
 | Other users | **Zero.** Nobody but the author has used it |
 
 ### Built and working
@@ -82,13 +83,17 @@ Original constraints, still shaping the app:
 - **Export** — copy history as readable markdown or lossless JSON, in either language.
 - **Editable program + substitution.**
 - **Language switch** — Profile tab and onboarding; the bot asks on first `/start`.
+- **AI program generation** — describe a program in plain text, review it, save it. Runs
+  server-side on the Worker; nothing is saved without the user pressing Save.
+- **Group board as a stat table** — the bot posts aligned standings rather than prose.
 
 ### Stack
 
-React 18 + esbuild → a single ~720 KB bundle, committed to the repo and served statically.
+React 18 + esbuild → a single ~740 KB bundle, committed to the repo and served statically.
 Tailwind via the Play CDN. recharts, lucide-react. Tests are jsdom driving the real UI, plus
-three buildless pure-module suites. ~3,600 lines in `app.jsx` (single-file by design), plus
-`src/scoring.js` and `src/i18n.js`.
+four buildless pure-module suites. ~3,800 lines in `app.jsx` (single-file by design), plus
+`src/scoring.js` and `src/i18n.js`. **The Worker has no npm dependencies** — the one external
+API call it makes uses native `fetch`.
 
 ---
 
@@ -111,6 +116,16 @@ sees, plus language preferences.
   answer from its own state.
 - **Store the inputs, not the finished numbers.** Effort decays with time; a cached total goes
   stale and lies. Keep session dates and recompute at read time.
+- **Publishing is incremental; syncing is the reconciler.** `/api/publish` only fires when a
+  workout finishes, which left a hole: someone who joined a group and typed `/score` read as a
+  blank 800 while their own app showed 1771. Same metric, one stale copy — but on screen it
+  looked like two different scoring systems. `/api/sync` now sends score + ledger on app open
+  and on join, and **replaces** rather than merges, so a ledger that drifted because a publish
+  was lost heals on the next open. An append-only design could never self-correct.
+
+**The Worker is no longer publish-only** — it also proxies AI program generation, which is
+the one thing in the project that costs money per call. The constraint that forced it there
+is unchanged and absolute: **an API key cannot ship in the client** (§5).
 
 ### The two shared modules
 
@@ -292,13 +307,49 @@ negative tells someone to load a lift that hurt.
 
 ### The AI constraint
 
-**There is no AI in this project at all** — no API key, no model call, nothing in
-`package.json`. The rule-based coach is plain JavaScript.
-
 **An API key cannot ship in the client.** The bundle is public. This already happened once and
-had to be torn out. The fix, if AI is ever added, is the Worker as a server-side proxy, with
-Telegram's `initData` signature verifying the caller plus per-user rate limiting.
-**Cost is not the blocker — a generation is a fraction of a cent. Abuse is.**
+had to be torn out. **Cost is not the blocker — a generation is a fraction of a cent. Abuse
+is.** The fix, now built: the Worker as a server-side proxy, `initData` verifying the caller,
+and a per-user daily cap.
+
+There is exactly **one** AI feature (program generation, §7) and it lives entirely on the
+Worker. **The coach is still pure rule-based JavaScript** — no network, works in a basement
+gym, and the pain check must never depend on a model being reachable.
+
+Three things hold the generator honest, and all three matter:
+
+1. **Schema-constrained output.** The model must return JSON whose `pattern` field is an enum
+   of the thirteen real movement-pattern ids. A hallucinated pattern is a *silent* failure —
+   the lift logs fine and simply never counts toward the score.
+2. **Exclusions are verified, not trusted.** The model reports back what it understood the
+   user to have ruled out; the Worker rejects the program if any exercise name matches. It
+   *will* produce a Romanian deadlift for someone who said no deadlifts, and the person asking
+   is usually asking because of an injury.
+3. **Nothing auto-saves.** Output lands in the editor as an unsaved change. A model proposes;
+   the user commits.
+
+Without an API key the endpoint returns a clean "not switched on" message and everything else
+is unaffected.
+
+**The provider is OpenAI**, not Anthropic — chosen because that's where the credit is. It is
+called with plain `fetch` (one POST to `/v1/chat/completions`, `response_format: json_schema`,
+`strict: true`), not an SDK: a single call doesn't justify a bundled dependency in a Worker
+that has never been deployed, where a bundling problem shows up as a broken deploy rather than
+a failing local test.
+
+**Everything provider-specific is in `callModel()`** — about thirty lines. Schema, validation,
+exclusion checks, prompts and the whole app-side UI are neutral. The move from Anthropic to
+OpenAI was one edit to that function, and moving again would be the same.
+
+Two OpenAI-specific traps, both already handled and both easy to reintroduce:
+
+- **Strict mode has stricter schema rules than the shape suggests.** Every object needs
+  `additionalProperties: false` *and* every property listed in `required` — optional fields
+  are not expressible. Violating either is a 400 at runtime, in production.
+  `tests/test-program-ai.mjs` walks the schema and fails locally instead.
+- **No output-token ceiling is sent.** The parameter was renamed across model generations
+  (`max_tokens` → `max_completion_tokens`) and newer models reject the old spelling, so
+  hard-coding either silently restricts which models `OPENAI_MODEL` can point at.
 
 ---
 
@@ -328,6 +379,13 @@ Telegram's `initData` signature verifying the caller plus per-user rate limiting
 | **Tier names stay English in both languages** | They're game ranks and what the group says out loud. "Золото" reads like a translation of a rank rather than the rank itself |
 | **Locale detection is a pre-selection, never a wall** | The bot confirms with two buttons; the app pre-sets and exposes a switch. Guessing wrong costs one tap |
 | **`ru` is the default for `kk`/`uk`/`uz`/… too** | The group is in Almaty. A Kazakh-locale phone wants Russian over English here |
+| **The group board is a table, not prose** | "X is now behind Y" reads oddly in a chat and buries the numbers people came for. A table shows the same movement for everyone without anyone parsing a sentence |
+| **Table columns are Rating and week effort, ranked on the 40/60 blend** | Those are the two numbers the app already shows, under the same names. The footer states the ranking rule because a ranking you can't derive from the visible columns looks arbitrary |
+| **The bot says "Rating", not "Strength"** | It's the same 800–2600 number the app's Progress tab shows. Two names for one metric read as two scoring systems |
+| **No emoji inside the standings block** | Medals render at variable width in monospace and knock every following column out of line. They go in the title |
+| **Every bot message carries the Open button** | It's the whole point of a Mini App bot. Routed through one `say()` helper because "remember to attach it" decays one call site at a time |
+| **AI generation on the Worker, never the client** | The bundle is public (§5). This is also why the coach stays rule-based |
+| **The model's exclusions are checked server-side** | It will produce the exact lift someone said they can't do, and they usually said it because of an injury |
 
 ---
 
@@ -366,11 +424,22 @@ rush. **Still the priority.** Candidate answers, cheapest first:
   correcting it is a copy decision. **Sweep user-facing copy whenever scoring changes**; a
   test pins the one sentence that was already caught wrong in the wild.
 - The Russian translation has not been read by a native speaker in situ.
+- `rankChange()` in `bot/relay.js` is now unused by the Worker — the standings table replaced
+  the prose it fed. Still exported and still tested; keep or delete deliberately.
+- The AI generator has **no way to iterate on an existing program** ("same but swap Fridays").
+  Each generation starts from scratch.
 
 ### Unverified
 
 - Whether the newest UI has been re-checked on a real phone since it shipped — including
-  whether the longer Russian strings actually fit.
+  whether the longer Russian strings actually fit. `tests/test-i18n.mjs` now enforces
+  character budgets on the labels that sit in fixed-width controls, which catches the
+  *regression* but was calibrated by eye, not by measurement.
+- **Whether the AI generator has ever run.** The validation layer is tested; the model call
+  is not (it costs money and isn't deterministic). It has never been executed against the
+  real API — no key has been set yet.
+- Whether the standings table aligns on a real phone. Verified at 29 columns in a terminal,
+  which is not the same as Telegram's monospace face.
 - Whether Telegram CloudStorage has *ever* actually run. Every test to date has exercised the
   `localStorage` fallback path.
 
@@ -394,29 +463,41 @@ rush. **Still the priority.** Candidate answers, cheapest first:
    yet** (see below). Identity is `initData` only, never the request body. Publishing is
    idempotent per session id. Fire-and-forget from the client, only after the local write
    succeeded.
-5. ~~English + Russian.~~ **Done.** Both surfaces, one dictionary, 12 suites green.
-6. **The motivation curve** (§7) — the priority now.
-7. **AI program generation** — last, and genuinely optional. Needs schema validation against
-   the 13 known pattern ids, an explicit check against stated exclusions (it *will* produce
-   RDLs for someone who said no RDLs), and review-before-commit in the existing editor.
+5. ~~English + Russian.~~ **Done.** Both surfaces, one dictionary.
+6. ~~Score sync.~~ **Done.** `/api/sync` closed the gap where the bot showed 800 while the app
+   showed the real rating (§3).
+7. ~~Group board as a stat table + Open button on every message.~~ **Done.**
+8. ~~AI program generation.~~ **Built.** `bot/program-ai.js` + `AiProgramPanel` in the app.
+   Schema-constrained to the 13 pattern ids, exclusions verified server-side, rate limited,
+   review-before-commit. **Has never been run against the real API** — needs a key.
+9. **The motivation curve** (§7) — now the priority, and the last big open question. Per-slot
+   tiers are still the cheapest answer and the data is already there.
 
 ### Waiting on Ramazan
 
-- **Redeploy the bot.** `npx wrangler deploy` from `bot/`. The Worker now imports
-  `src/i18n.js`, handles `callback_query`, and reads/writes two new KV shapes
-  (`user.lang`, `grouplang:<chatId>`). **Until this runs, the deployed bot is still the
-  English-only build.**
+Nothing below has shipped yet — **the deployed bot and the deployed app are both older than
+this document.**
+
+- **Redeploy the Worker.** `npx wrangler deploy` from `bot/`. It now imports `src/i18n.js` and
+  `bot/program-ai.js`, handles `callback_query`, serves `/api/sync` and `/api/program`, and
+  reads/writes three new KV shapes (`user.lang`, `grouplang:<chatId>`, `aiquota:<id>:<date>`).
 - **Rebuild and push `dist/app.js`** — Pages has no build step, so the deployed app stays on
   old code otherwise. (`npm test` rebuilds it; the push is manual.)
+- **Set the API key** to switch program generation on:
+  `npx wrangler secret put OPENAI_API_KEY` from `bot/`, then deploy again. Never paste it into
+  a chat or a file. Everything else works without it.
+  **Confirm the model is one your account can actually use** — the default is `gpt-4o`; set
+  `OPENAI_MODEL` under `[vars]` in `wrangler.toml` to change it. A model name your key can't
+  reach returns a 400, which the Worker logs with the response body.
 - **Re-run `/setcommands` in BotFather** to add `/language` to the menu — `bot/README.md` has
   the block to paste.
 - **Add the bot to the group chat**, run `/register`, pick the board language, paste the code
   into Profile → Group leaderboard.
-- **Read the Russian on a real phone.** Automated tests prove the strings are *present* and
-  that no key is missing; they cannot tell you a sentence reads like a translation, or that a
-  nav label wraps.
-- **An Anthropic API key**, for step 7 only — set via `npx wrangler secret put
-  ANTHROPIC_API_KEY`, never pasted into a chat or a file.
+- **Read the Russian on a real phone**, and check the standings table alignment there.
+  Automated tests prove the strings are present and within their character budgets; they
+  cannot tell you a sentence reads like a translation.
+- **Try one real generation** and read what comes back before letting friends near it. The
+  validation layer is tested against fabricated output, not against the model's.
 
 ### Settled configuration
 
@@ -426,3 +507,6 @@ rush. **Still the priority.** Candidate answers, cheapest first:
 - Combined score: **40 strength / 60 effort**.
 - Languages: **en, ru**. Adding a third is a matter of adding one object to `STRINGS` and one
   entry to `LANGS`; `tests/test-i18n.mjs` will fail until every key is covered.
+- AI provider: **OpenAI**, default model `gpt-4o`, overridable with an `OPENAI_MODEL` var
+  without touching code. Must support structured outputs. 15 generations per user per day.
+  `bot/program-ai.js` holds every knob.

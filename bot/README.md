@@ -50,7 +50,9 @@ Three settings, deliberately separate:
 |---|---|
 | `POST /api/join` | Redeems a join code, adds you to that group's board |
 | `POST /api/publish` | Records a finished session and announces it to the group |
+| `POST /api/sync` | Reconciles the stored score with the client's. Announces nothing |
 | `POST /api/me` | Your standing plus the current board |
+| `POST /api/program` | Generates a training program from a plain-text description |
 
 Every one of them requires a valid Telegram `initData` signature — identity comes from the
 signature, never from the request body, so claiming to be someone else gets nowhere. See
@@ -61,6 +63,52 @@ HMAC.
 ledger of `{date, effort}` pairs. **Not** sets, reps, notes or programs — those never leave
 CloudStorage on each user's own account. If the KV store were wiped, every client could
 republish.
+
+### Why `/api/sync` exists
+
+`/api/publish` only fires when a workout is finished, so someone who joined a group and then
+typed `/score` read as a blank 800 while their own app showed their real rating — the same
+metric, one stale copy. `/api/sync` is the reconciling counterpart: the app sends its score
+and ledger on open and on join, and the Worker replaces (not merges) what it holds. Replacing
+is what lets a ledger that drifted because a publish was lost heal on the next app open.
+
+### Program generation
+
+`POST /api/program` takes a plain-text description and returns a validated program. This is
+the only endpoint that costs money per call, so:
+
+- **The key never reaches the client.** The Mini App bundle is public; an earlier client-side
+  attempt had to be torn out for exactly this reason. Cost was never the blocker — abuse is.
+- **Callers are verified** by `initData` like every other endpoint, and **rate limited** to 15
+  generations per user per day (`aiquota:` keys in KV, self-expiring).
+- **Output is schema-constrained.** The model must return JSON matching a fixed schema whose
+  `pattern` field is an enum of the thirteen real movement-pattern ids — a hallucinated
+  pattern would leave an exercise silently unscoreable.
+- **Exclusions are checked, not trusted.** The model reports back what it understood the user
+  to have ruled out, and the Worker rejects the program if any exercise name matches. It will
+  otherwise happily produce a Romanian deadlift for someone who said no deadlifts, and the
+  person asking is usually asking because of an injury.
+- **Nothing is auto-saved.** The generated program lands in the editor as an unsaved change
+  and the user still has to press Save.
+
+Without `OPENAI_API_KEY` set, the endpoint returns a clean "not switched on yet" message and
+the rest of the bot is unaffected.
+
+**Provider.** This runs on OpenAI, called with plain `fetch` — one POST to
+`/v1/chat/completions` with `response_format: json_schema` and `strict: true`, which is what
+makes the schema binding rather than advisory. No SDK: it's a single call, and a bundled
+dependency is one more thing that can break a Worker deploy.
+
+Everything provider-specific lives in `callModel()` in `bot/program-ai.js` — about thirty
+lines. The schema, validation, exclusion checks, prompts and app UI are all neutral, so
+moving to a different provider means editing that one function. (It started on Anthropic and
+moved in exactly one edit.)
+
+**Model.** Defaults to `gpt-4o`. Point it somewhere else with an `OPENAI_MODEL` var in
+`wrangler.toml` — no code change needed. Whatever you pick must support structured outputs
+(`response_format: json_schema`); not every model does. No output-token ceiling is sent,
+because the parameter that sets one was renamed across model generations and hard-coding
+either spelling silently restricts which models you can point at.
 
 ## Setup (~10 minutes, once)
 
@@ -100,6 +148,21 @@ You should get `{"ok":true,"result":true,...}`. Now message the bot `/start`.
 
 To check it later: `https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo` — look at
 `last_error_message`, which is where the reason for a silent bot will be.
+
+**6. Optional — turn on program generation.** Get a key from
+[platform.openai.com](https://platform.openai.com/api-keys), then:
+
+```bash
+cd bot
+wrangler secret put OPENAI_API_KEY   # paste it here, never into a file or a chat
+wrangler deploy
+```
+
+To use a model other than the `gpt-4o` default, add `OPENAI_MODEL = "..."` under `[vars]` in
+`wrangler.toml` and deploy again.
+
+Skip this entirely and everything else still works — the generator just reports that it isn't
+switched on. Each user is capped at 15 generations per day.
 
 ## The other half: the link preview
 

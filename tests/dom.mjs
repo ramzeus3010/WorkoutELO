@@ -40,6 +40,29 @@ export function makeDom() {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Wait until `predicate()` is true, polling until `timeout`.
+ *
+ * Prefer this over a fixed `sleep` before asserting on rendered output. Each suite creates
+ * several jsdom windows and never closes them, and the rest-timer ring keeps a
+ * requestAnimationFrame loop running in every one — so by the third or fourth block the same
+ * React update genuinely takes longer to land than it did in the first. A fixed sleep that
+ * passes in isolation then fails in sequence, which reads as a real regression.
+ *
+ * Returns true if the condition was met, false on timeout — so a caller can still assert and
+ * get a useful failure message rather than an exception.
+ */
+export async function waitFor(predicate, { timeout = 3000, interval = 50 } = {}) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try {
+      if (predicate()) return true;
+    } catch (e) { /* not rendered yet — keep polling */ }
+    await sleep(interval);
+  }
+  return false;
+}
+
 // React installs its own value setter on inputs, so assigning .value directly is
 // invisible to it. Go through the native prototype setter, then fire the event.
 export function setNativeValue(win, el, value) {
