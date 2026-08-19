@@ -231,6 +231,22 @@ const en = {
   "tier.Diamond": "Diamond",
   "tier.Top 5%": "Top 5%",
 
+  // -- short headings that a WithInfo (i) toggle hangs off --
+  // These replace paragraphs that used to sit open on every screen. Keep them to one short
+  // line: the whole point is that the screen reads as a list of things you can do, with the
+  // reasoning one tap away rather than in the way.
+  "common.whatsThis": "What's this?",
+  "log.oneOffTitle": "One-offs count toward your rating",
+  "act.explainTitle": "Counts toward showing up, not toward strength",
+  "swap.title": "Swap for today only",
+  "prof.weightExplainTitle": "Your rating is relative to your bodyweight",
+  "prof.privacyTitle": "Everything stays on your Telegram account",
+  "exp.panelTitleSub": "Copy your training out, or keep a backup",
+  "prog.benchmarkCaveatTitle": "Benchmarks are estimates, not measurements",
+  "board.snapshotTitle": "A snapshot, not a live feed",
+  "prog.explainTitle": "Changes apply to every future workout",
+  "prog.ratingNoteTitle": "How your program affects your rating",
+  "ai.explainTitle": "Describe it in plain words",
   // -- chrome --
   "app.tagline": "Training Log",
   "app.loading": "Loading log…",
@@ -695,6 +711,19 @@ const ru = {
   "tier.Diamond": "Diamond",
   "tier.Top 5%": "Top 5%",
 
+  // -- short headings that a WithInfo (i) toggle hangs off --
+  "common.whatsThis": "Что это?",
+  "log.oneOffTitle": "Разовые упражнения идут в рейтинг",
+  "act.explainTitle": "Считается за посещаемость, не за силу",
+  "swap.title": "Замена только на сегодня",
+  "prof.weightExplainTitle": "Рейтинг считается относительно веса тела",
+  "prof.privacyTitle": "Всё хранится в вашем аккаунте Telegram",
+  "exp.panelTitleSub": "Выгрузить тренировки или сделать копию",
+  "prog.benchmarkCaveatTitle": "Эталоны — оценки, а не замеры",
+  "board.snapshotTitle": "Снимок, а не живая лента",
+  "prog.explainTitle": "Изменения действуют на все будущие тренировки",
+  "prog.ratingNoteTitle": "Как программа влияет на рейтинг",
+  "ai.explainTitle": "Опишите обычными словами",
   // -- chrome --
   "app.tagline": "Дневник тренировок",
   "app.loading": "Загрузка…",

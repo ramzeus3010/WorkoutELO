@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Plus, X, Save, ChevronDown, ChevronUp, Trash2, TrendingUp, Dumbbell, History, LineChart as LineChartIcon, Loader2, Play, Pause, RotateCcw, SkipForward, ExternalLink, NotebookPen, Sparkles, ArrowDown, User, Award, Users, Share2, Check, Copy, FileText } from "lucide-react";
+import { Plus, X, Save, ChevronDown, ChevronUp, Trash2, TrendingUp, Dumbbell, History, LineChart as LineChartIcon, Loader2, Play, Pause, RotateCcw, SkipForward, ExternalLink, NotebookPen, Sparkles, ArrowDown, User, Award, Users, Share2, Check, Copy, FileText, Info } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 // The cross-user scoring maths lives in its own module because the bot Worker needs the
 // identical implementation to answer /score with no client running — see src/scoring.js.
@@ -731,6 +731,51 @@ function useDayName() {
   return useCallback((d) => dayDisplayName(lang, d && d.id, d && d.name), [lang]);
 }
 
+/**
+ * A hint that stays out of the way until asked for.
+ *
+ * Every screen had accumulated a paragraph explaining itself — why bodyweight is required,
+ * how substitution scores, what the export formats are for. Each one was worth writing and
+ * none of them are worth reading twice, so on the fifth visit they are just noise between you
+ * and the thing you opened the app to do. They're all still here, one tap away.
+ *
+ * Wraps the heading it belongs to rather than floating on its own, so the ⓘ is attached to
+ * something: an unlabelled ⓘ makes people tap it to find out what it is, which is the
+ * opposite of the point.
+ *
+ * Russian runs longer than English, so this earns more room back on the Russian UI than the
+ * English one — which is where the complaint came from.
+ */
+function WithInfo({ children, text, className = "", tone = "muted" }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const dot = tone === "light"
+    ? (open ? "bg-white/25 text-white" : "bg-white/10 text-gray-400")
+    : (open ? "bg-maroon-600 text-white" : "bg-gray-200 text-gray-500");
+
+  return (
+    <div className={className}>
+      <div className="flex items-center gap-1.5">
+        <div className="flex-1 min-w-0">{children}</div>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-label={t("common.whatsThis")}
+          className={`shrink-0 flex items-center justify-center w-6 h-6 rounded-full transition-colors ${dot}`}
+        >
+          <Info size={13} />
+        </button>
+      </div>
+      {open && (
+        <p className={`text-xs leading-snug mt-1.5 ${tone === "light" ? "text-gray-400" : "text-gray-500"}`}>
+          {text}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ---------- Main App ----------
 export default function App() {
   const [tab, setTab] = useState("log");
@@ -740,6 +785,9 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [onboarded, setOnboarded] = useState(true); // assume yes until storage says otherwise, so onboarding can't flash on reload
+  // Whether entering the program editor should land with the generator already open. Set by
+  // which button in Profile was pressed, so the two entry points reach the same screen.
+  const [programAiOpen, setProgramAiOpen] = useState(false);
   // Seeded synchronously from the Telegram account so the very first paint is already in the
   // right language. Storage is read a moment later and wins if the user has ever chosen.
   const [lang, setLang] = useState(() => detectLang(TG && TG.initDataUnsafe && TG.initDataUnsafe.user && TG.initDataUnsafe.user.language_code));
@@ -897,7 +945,7 @@ export default function App() {
                 onSave={saveProfile}
                 sessions={sessions}
                 program={program}
-                onEditProgram={() => setTab("program")}
+                onEditProgram={({ openAi } = {}) => { setProgramAiOpen(!!openAi); setTab("program"); }}
                 lang={lang}
                 onLang={changeLang}
               />
@@ -906,6 +954,7 @@ export default function App() {
               <ProgramEditor
                 program={program}
                 profile={profile}
+                autoOpenAi={programAiOpen}
                 onCommit={commitProgram}
                 onReset={restoreDefaultProgram}
                 onBack={() => setTab("profile")}
@@ -1649,7 +1698,9 @@ function ActivityLog({ onSave }) {
 
   return (
     <div>
-      <p className="text-xs text-gray-500 mb-3">{t("act.explain")}</p>
+      <WithInfo text={t("act.explain")} className="mb-3">
+        <p className="text-xs text-gray-500">{t("act.explainTitle")}</p>
+      </WithInfo>
 
       <div className="grid grid-cols-2 gap-1.5 mb-4">
         {ACTIVITY_TYPES.map((a) => (
@@ -1959,7 +2010,9 @@ function LogView({ onSave, timer, sessions, program }) {
       {/* This copy was wrong in the wild once — it still claimed one-offs "don't count toward
           your rating" long after that rule was deleted. Re-read it whenever scoring changes;
           tests/test-program.mjs pins the corrected sentence. */}
-      <p className="text-xs text-gray-400 mt-1.5 text-center leading-snug">{t("log.oneOffHint")}</p>
+      <WithInfo text={t("log.oneOffHint")} className="mt-1.5">
+        <p className="text-xs text-gray-400 leading-snug">{t("log.oneOffTitle")}</p>
+      </WithInfo>
 
       <button
         onClick={handleSave}
@@ -2126,7 +2179,9 @@ function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel })
 
   return (
     <div className="mx-3.5 mb-3 rounded-md bg-white border border-gray-200 px-2.5 py-2.5">
-      <p className="text-xs text-gray-500 mb-2 leading-snug">{t("swap.explain")}</p>
+      <WithInfo text={t("swap.explain")} className="mb-2">
+        <p className="text-xs font-semibold text-gray-700">{t("swap.title")}</p>
+      </WithInfo>
 
       {loggedSets > 0 && (
         <p className="text-xs text-maroon-700 mb-2 leading-snug">
@@ -2180,7 +2235,9 @@ function SwapPanel({ program, currentId, slotId, loggedSets, onPick, onCancel })
             placeholder={t("swap.customPlaceholder")}
             className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
-          <p className="text-xs text-gray-500 mb-1 leading-snug">{t("swap.patternHint")}</p>
+          <WithInfo text={t("swap.patternHint")} className="mb-1">
+            <p className="text-xs text-gray-500">{t("log.patternLabel")}</p>
+          </WithInfo>
           <PatternSelect value={customPattern} onChange={setCustomPattern} className="w-full mb-2 bg-gray-50 rounded-md px-2.5 py-2 text-sm text-gray-900 border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600" />
           <button
             onClick={pickCustom}
@@ -2805,7 +2862,9 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram, lang, 
         <LangToggle lang={lang} onLang={onLang} />
       </div>
 
-      <p className="text-xs text-gray-500 mb-4">{t("prof.weightExplain")}</p>
+      <WithInfo text={t("prof.weightExplain")} className="mb-4">
+        <p className="text-xs text-gray-500">{t("prof.weightExplainTitle")}</p>
+      </WithInfo>
 
       <div className="rounded-xl bg-gray-50 border border-gray-200 p-4 space-y-4">
         <label className="block">
@@ -2874,9 +2933,18 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram, lang, 
             exerciseUnit: plural(lang, programSlots(program).length, "unit.exercise"),
           })}
         </p>
+        {/* Two entry points to the same screen. Generation used to live only inside the
+            editor, which meant finding it required already knowing it existed — the first
+            person to look for it didn't. It opens the editor with the panel already open. */}
         <button
-          onClick={onEditProgram}
+          onClick={() => onEditProgram({ openAi: true })}
           className="w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold bg-maroon-600 text-white"
+        >
+          <Sparkles size={15} /> {t("ai.open")}
+        </button>
+        <button
+          onClick={() => onEditProgram({ openAi: false })}
+          className="w-full mt-1.5 flex items-center justify-center gap-2 rounded-md py-2.5 text-sm font-semibold bg-white border border-gray-200 text-gray-700"
         >
           <Dumbbell size={15} /> {t("prof.editProgram")}
         </button>
@@ -2886,9 +2954,9 @@ function ProfileView({ profile, onSave, sessions, program, onEditProgram, lang, 
 
       <ExportPanel sessions={sessions} profile={profile} program={program} />
 
-      <div className="mt-5 rounded-xl bg-maroon-50 border border-maroon-100 px-4 py-3">
-        <p className="text-sm text-maroon-800 leading-snug">{t("prof.privacy")}</p>
-      </div>
+      <WithInfo text={t("prof.privacy")} className="mt-5 rounded-xl bg-maroon-50 border border-maroon-100 px-4 py-3">
+        <p className="text-sm text-maroon-800 leading-snug font-semibold">{t("prof.privacyTitle")}</p>
+      </WithInfo>
     </div>
   );
 }
@@ -2951,9 +3019,9 @@ function programFromGenerated(generated) {
  * press Save — the model's output is a proposal, never a commit. That's the whole reason this
  * lives inside the editor rather than being its own screen.
  */
-function AiProgramPanel({ profile, lang, onAccept }) {
+function AiProgramPanel({ profile, lang, autoOpen, onAccept }) {
   const t = useT();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(!!autoOpen);
   const [prompt, setPrompt] = useState("");
   const [state, setState] = useState({ status: "idle" }); // idle | working | preview | error
   const [result, setResult] = useState(null);
@@ -3045,7 +3113,9 @@ function AiProgramPanel({ profile, lang, onAccept }) {
         </>
       ) : (
         <>
-          <p className="text-xs text-gray-600 mb-2 leading-snug">{t("ai.explain")}</p>
+          <WithInfo text={t("ai.explain")} className="mb-2">
+            <p className="text-xs text-gray-600">{t("ai.explainTitle")}</p>
+          </WithInfo>
           <textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
@@ -3084,7 +3154,7 @@ function AiProgramPanel({ profile, lang, onAccept }) {
   );
 }
 
-function ProgramEditor({ program, profile, onCommit, onReset, onBack }) {
+function ProgramEditor({ program, profile, autoOpenAi, onCommit, onReset, onBack }) {
   const t = useT();
   const lang = useLang();
   const dayName = useDayName();
@@ -3171,11 +3241,14 @@ function ProgramEditor({ program, profile, onCommit, onReset, onBack }) {
       </button>
 
       <h2 className="text-2xl font-bold tracking-tight mb-1">{t("prog.title")}</h2>
-      <p className="text-sm text-gray-500 mb-4 leading-snug">{t("prog.explain")}</p>
+      <WithInfo text={t("prog.explain")} className="mb-4">
+        <p className="text-sm text-gray-500 leading-snug">{t("prog.explainTitle")}</p>
+      </WithInfo>
 
       <AiProgramPanel
         profile={profile}
         lang={lang}
+        autoOpen={autoOpenAi}
         onAccept={(generated) => {
           setDraft(generated);
           setOpenDayId(generated.days[0] ? generated.days[0].id : null);
@@ -3281,7 +3354,9 @@ function ProgramEditor({ program, profile, onCommit, onReset, onBack }) {
         {/* NB: this paragraph describes the OLD program-relative rating. Under fixed pattern
             slots your program no longer moves your score at all — flagged rather than
             silently reworded, because correcting it is a copy decision, not a translation. */}
-        <p className="text-sm text-gray-500 leading-snug mb-2">{t("prog.ratingNote")}</p>
+        <WithInfo text={t("prog.ratingNote")} className="mb-2">
+          <p className="text-sm text-gray-500 leading-snug">{t("prog.ratingNoteTitle")}</p>
+        </WithInfo>
         {confirmReset ? (
           <div className="flex gap-1.5">
             <button
@@ -3374,7 +3449,9 @@ function ProgramExerciseRow({ exercise, editing, canMoveUp, canMoveDown, onToggl
             placeholder={t("prog.formLink")}
             className="w-full bg-gray-50 rounded-md px-2.5 py-2 text-sm border border-gray-200 focus:outline-none focus:ring-1 focus:ring-maroon-600"
           />
-          <p className="text-xs text-gray-500 pt-1 leading-snug">{t("prog.patternNote")}</p>
+          <WithInfo text={t("prog.patternNote")} className="pt-1">
+            <p className="text-xs text-gray-500">{t("log.patternLabel")}</p>
+          </WithInfo>
           <PatternSelect
             value={exercise.pattern}
             onChange={(next) => onChange({ pattern: next, meta: metaFromPattern(next) })}
@@ -3573,7 +3650,9 @@ function ExportPanel({ sessions, profile, program }) {
         <FileText size={14} className="text-maroon-600" />
         <p className="text-sm uppercase tracking-wider text-gray-500 font-semibold">{t("exp.panelTitle")}</p>
       </div>
-      <p className="text-sm text-gray-500 mb-3 leading-snug">{t("exp.panelExplain")}</p>
+      <WithInfo text={`${t("exp.panelExplain")} ${t("exp.footnote")}`} className="mb-3">
+        <p className="text-sm text-gray-500 leading-snug">{t("exp.panelTitleSub")}</p>
+      </WithInfo>
 
       <div className="flex gap-1.5 mb-3">
         {EXPORT_RANGES.map((r) => (
@@ -3623,7 +3702,7 @@ function ExportPanel({ sessions, profile, program }) {
         </div>
       )}
 
-      <p className="text-sm text-gray-400 mt-2.5 leading-snug">{t("exp.footnote")}</p>
+
     </div>
   );
 }
@@ -3719,7 +3798,9 @@ function RatingCard({ eloResult, profile }) {
 
       {/* Honesty note — see workout_tracker.md §6. There is no published strength-standard
           database for dumbbell lifts, so the benchmarks are derived estimates. Keep this visible. */}
-      <p className="text-xs text-gray-500 mt-3 leading-snug">{t("prog.benchmarkCaveat")}</p>
+      <WithInfo text={t("prog.benchmarkCaveat")} className="mt-3" tone="light">
+        <p className="text-xs text-gray-500">{t("prog.benchmarkCaveatTitle")}</p>
+      </WithInfo>
     </div>
   );
 }
@@ -3861,7 +3942,9 @@ function Leaderboard({ displayName, rating, tierName }) {
         </div>
       )}
 
-      <p className="text-xs text-gray-400 mt-2.5">{t("board.snapshotNote")}</p>
+      <WithInfo text={t("board.snapshotNote")} className="mt-2.5">
+        <p className="text-xs text-gray-400">{t("board.snapshotTitle")}</p>
+      </WithInfo>
     </div>
   );
 }

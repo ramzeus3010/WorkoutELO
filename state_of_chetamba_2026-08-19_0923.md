@@ -386,6 +386,9 @@ Two OpenAI-specific traps, both already handled and both easy to reintroduce:
 | **Every bot message carries the Open button** | It's the whole point of a Mini App bot. Routed through one `say()` helper because "remember to attach it" decays one call site at a time |
 | **AI generation on the Worker, never the client** | The bundle is public (§5). This is also why the coach stays rule-based |
 | **The model's exclusions are checked server-side** | It will produce the exact lift someone said they can't do, and they usually said it because of an injury |
+| **Generation has two entry points, both in Profile** | It shipped only inside the program editor and the first person to look for it gave up. Discovery is a feature; `tests/test-program.mjs` now asserts it from a cold start |
+| **Explanatory copy sits behind a ⓘ toggle** | ~2,200 characters of it were open on every screen. Each paragraph was worth writing and none are worth reading twice — on the fifth visit they're noise between you and the thing you opened the app to do |
+| **The ⓘ wraps a heading, never floats alone** | An unlabelled ⓘ makes people tap it to find out what it is, which is the opposite of the point |
 
 ---
 
@@ -482,7 +485,9 @@ this document.**
   `bot/program-ai.js`, handles `callback_query`, serves `/api/sync` and `/api/program`, and
   reads/writes three new KV shapes (`user.lang`, `grouplang:<chatId>`, `aiquota:<id>:<date>`).
 - **Rebuild and push `dist/app.js`** — Pages has no build step, so the deployed app stays on
-  old code otherwise. (`npm test` rebuilds it; the push is manual.)
+  old code otherwise. (`npm test` rebuilds it; the push is manual.) **Then fully close the
+  Mini App rather than backgrounding it** — Telegram caches the webview hard, and "the new
+  button isn't there" is what a stale cache looks like.
 - **Set the API key** to switch program generation on:
   `npx wrangler secret put OPENAI_API_KEY` from `bot/`, then deploy again. Never paste it into
   a chat or a file. Everything else works without it.

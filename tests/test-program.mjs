@@ -8,7 +8,7 @@
 
 import {
   BUNDLE, makeDom, sleep, buttonWithText, click, setNativeValue, rootText,
-  daysAgoISO, check, finish,
+  daysAgoISO, check, finish, openInfo,
 } from "./dom.mjs";
 
 function boot({ seed } = {}) {
@@ -41,6 +41,10 @@ console.log("editing");
   click(w, buttonWithText(doc, "Edit program"));
   await sleep(400);
   check("the editor opens", rootText(w).includes("Your program"));
+  // The rationale now lives behind a (i) toggle rather than sitting open on the screen.
+  // Still asserted, because "the explanation is reachable" is the thing worth pinning.
+  openInfo(w, doc, 0);
+  await sleep(200);
   check("the editor explains it is not the same as a one-day swap", /Swap/.test(rootText(w)));
   check("the built-in days are listed", rootText(w).includes("Upper A") && rootText(w).includes("Lower B"));
 
@@ -128,6 +132,9 @@ console.log("substitution");
   await sleep(300);
 
   check("the swap panel says it is for today only", /for today only/i.test(rootText(w)));
+  const swapPanel = swapBtn.closest(".rounded-xl") || doc;
+  openInfo(w, swapPanel, 0);
+  await sleep(200);
   check("the swap panel says the work still counts toward the slot", /counts toward this slot/i.test(rootText(w)));
 
   // Swap the bench press for something not in the program at all.
@@ -302,6 +309,33 @@ console.log("renaming keeps history");
   check("the coach still finds history after a rename",
     coached.includes("24kg") && !coached.includes("No history yet"),
     "renaming detached the exercise from its own history");
+}
+
+// ---------------------------------------------------------------- reaching the generator
+// The generator was originally only inside the program editor, which meant finding it
+// required already knowing it was there — the first person to look for it gave up. Discovery
+// is a real feature, so it gets a real test: from a cold start, can you reach it?
+console.log("\nfinding the program generator");
+{
+  const { w, doc } = boot();
+  await sleep(700);
+
+  click(w, buttonWithText(doc, "Profile"));
+  await sleep(400);
+
+  const generate = buttonWithText(doc, "Write a program for me");
+  check("Profile offers program generation directly", !!generate, rootText(w).slice(0, 400));
+
+  click(w, generate);
+  await sleep(500);
+
+  // Entering this way should land with the panel already open, not collapsed behind another
+  // tap — the button promised a thing, so the thing should be on screen.
+  const text = rootText(w);
+  check("it opens the editor", text.includes("Your program"));
+  check("the generator panel is already open", text.includes("Describe your program"), text.slice(0, 400));
+  check("the prompt box is ready to type in", !!doc.querySelector("textarea"));
+  check("and it offers a Generate action", !!buttonWithText(doc, "Generate"));
 }
 
 finish("program");

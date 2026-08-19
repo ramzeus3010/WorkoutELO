@@ -80,6 +80,24 @@ export function buttonWithText(doc, text) {
   return [...doc.querySelectorAll("button")].find((b) => b.textContent.includes(text));
 }
 
+/**
+ * Expand a WithInfo (ⓘ) hint so its text is in the DOM.
+ *
+ * Explanatory copy used to sit open on every screen; it's now one tap away. Tests that assert
+ * on that copy are still asserting something real — that the explanation is *reachable* — so
+ * they open it rather than being deleted. `root` scopes the search (pass a panel element to
+ * hit that panel's toggle rather than the first one on the page).
+ */
+export function infoToggles(root) {
+  return [...root.querySelectorAll("button[aria-expanded]")];
+}
+
+export function openInfo(win, root, index = 0) {
+  const button = infoToggles(root)[index];
+  if (button) click(win, button);
+  return !!button;
+}
+
 export function rootText(win) {
   return win.document.getElementById("root").textContent;
 }
