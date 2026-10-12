@@ -292,6 +292,12 @@ const en = {
   "tpl.upper-lower-4.blurb": "More volume per muscle. Legs are built into two of the four days on purpose.",
   "tpl.dumbbells-home": "Dumbbells only, 3 days",
   "tpl.dumbbells-home.blurb": "No machines, no barbell. For training at home or a small building gym.",
+  "tpl.express-20": "Express, 20 minutes",
+  "tpl.express-20.blurb": "Six short days, three exercises each, almost no rest. Built for training most days rather than twice a week.",
+  "tpl.open": "Start from a template",
+  "tpl.title": "Starting programs",
+  "tpl.explainTitle": "Replace your program with one of the built-in ones.",
+  "tpl.explain": "Picking a template replaces every day in your program, so your old days and their targets are gone once you save. Your logged history isn't touched — it stays attached to the exercises, not to the program. Nothing is written until you press Save, so you can look and back out.",
 
   // -- rest timer --
   "timer.quickTitle": "Quick Rest Timer",
@@ -354,6 +360,7 @@ const en = {
   "ex.walking-lunge": "Walking Lunge",
   "ex.single-arm-row": "Single-Arm Row",
   "ex.goblet-squat": "Goblet Squat",
+  "ex.push-up": "Push-Up",
 
   // -- program day names --
   "day.upper-a": "Upper A",
@@ -370,6 +377,9 @@ const en = {
   "day.push": "Push",
   "day.pull": "Pull",
   "day.legs": "Legs",
+  "day.hinge": "Hinge",
+  "day.arms": "Arms",
+  "day.legs-b": "Legs B",
   "day.adhoc": "Ad-hoc",
   "day.adhoc.subtitle": "Anything you did today — add exercises as you go.",
 
@@ -770,6 +780,12 @@ const ru = {
   "tpl.upper-lower-4.blurb": "Больше объёма на каждую мышцу. Ноги специально стоят в двух днях из четырёх.",
   "tpl.dumbbells-home": "Только гантели, 3 дня",
   "tpl.dumbbells-home.blurb": "Без тренажёров и штанги. Для дома или небольшого зала в доме.",
+  "tpl.express-20": "Экспресс, 20 минут",
+  "tpl.express-20.blurb": "Шесть коротких дней, по три упражнения, почти без отдыха. Для тех, кто тренируется почти каждый день, а не два раза в неделю.",
+  "tpl.open": "Взять готовую программу",
+  "tpl.title": "Готовые программы",
+  "tpl.explainTitle": "Заменить вашу программу одной из готовых.",
+  "tpl.explain": "Выбор шаблона заменяет все дни вашей программы — старые дни и их цели исчезнут после сохранения. История тренировок не затрагивается: она привязана к упражнениям, а не к программе. Ничего не записывается до кнопки «Сохранить», так что можно посмотреть и отказаться.",
 
   // -- rest timer --
   "timer.quickTitle": "Быстрый таймер отдыха",
@@ -832,6 +848,7 @@ const ru = {
   "ex.walking-lunge": "Выпады в движении",
   "ex.single-arm-row": "Тяга одной рукой",
   "ex.goblet-squat": "Присед с гантелью у груди",
+  "ex.push-up": "Отжимания",
 
   // -- program day names --
   "day.upper-a": "Верх A",
@@ -848,6 +865,9 @@ const ru = {
   "day.push": "Жимовой",
   "day.pull": "Тяговый",
   "day.legs": "Ноги",
+  "day.hinge": "Наклон",
+  "day.arms": "Руки",
+  "day.legs-b": "Ноги B",
   "day.adhoc": "Свободный",
   "day.adhoc.subtitle": "Всё, что вы сегодня делали — добавляйте упражнения по ходу.",
 

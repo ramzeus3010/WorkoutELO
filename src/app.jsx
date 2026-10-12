@@ -278,6 +278,60 @@ const PROGRAM_TEMPLATES = [
       ] },
     ],
   },
+  // The short-daily format: 20 minutes, six days, three exercises, 20-30 s rest.
+  //
+  // Every day deliberately covers THREE DISTINCT MOVEMENT PATTERNS rather than one muscle
+  // group, and that is a scoring decision as much as a training one. liftingEffort() credits
+  // distinct patterns per session, saturating — so a true "chest day" is one pattern, worth
+  // ~0.43 effort. Seven of those is 3.0 against an EFFORT_FULL_WEEK of 4.0, i.e. training
+  // every single day would cap you at 75 effort points while four upper/lower days reach 100.
+  // Three patterns a day is ~0.98, so six days clears the week comfortably.
+  //
+  // The alternative was adding a days-trained bonus to the effort axis. Pairing patterns was
+  // chosen first because it needs no change to the scoring model and is better training
+  // anyway: three hard sets on one pattern is where the returns stop, which is exactly what
+  // SETS_FOR_FULL_PATTERN already encodes.
+  //
+  // The six days also cover all 12 ranked slots once each week, so strength keeps moving
+  // instead of decaying — on a 21-day half-life a 6-day rotation is gentler than the 4-day
+  // split, not harsher.
+  {
+    id: "express-20",
+    name: "Express, 20 minutes",
+    blurb: "Six short days, three exercises each, almost no rest. Every day covers three movement patterns, so training daily counts for what it should.",
+    days: [
+      { name: "Push", exercises: [
+        TEMPLATE_EXERCISE("Incline Press", "push-horizontal", "3 x 10-12", 25),
+        TEMPLATE_EXERCISE("Overhead Press", "push-vertical", "3 x 10-12", 25),
+        TEMPLATE_EXERCISE("Triceps Extension", "isolation-upper", "3 x 12-15", 20),
+      ] },
+      { name: "Pull", exercises: [
+        TEMPLATE_EXERCISE("Pulldown / Pull-Up", "pull-vertical", "3 x 8-12", 25),
+        TEMPLATE_EXERCISE("Row", "pull-horizontal", "3 x 10-12", 25),
+        TEMPLATE_EXERCISE("Curl", "isolation-upper", "3 x 12-15", 20),
+      ] },
+      { name: "Legs", exercises: [
+        TEMPLATE_EXERCISE("Goblet Squat", "squat", "3 x 10-12", 30),
+        TEMPLATE_EXERCISE("Split Squat", "lunge", "3 x 10/leg", 25),
+        TEMPLATE_EXERCISE("Calf Raise", "calves", "3 x 15-20", 20),
+      ] },
+      { name: "Hinge", exercises: [
+        TEMPLATE_EXERCISE("Hip Hinge", "hinge", "3 x 10-12", 30),
+        TEMPLATE_EXERCISE("Back Extension", "bodyweight-reps", "3 x 12-15", 20),
+        TEMPLATE_EXERCISE("Plank", "core", "3 x 40s", 20),
+      ] },
+      { name: "Arms", exercises: [
+        TEMPLATE_EXERCISE("Lateral Raise", "isolation-upper", "3 x 12-15", 20),
+        TEMPLATE_EXERCISE("Push-Up", "bodyweight-reps", "3 x 10-20", 25),
+        TEMPLATE_EXERCISE("Side Plank", "core", "3 x 30s/side", 20),
+      ] },
+      { name: "Legs B", exercises: [
+        TEMPLATE_EXERCISE("Squat / Leg Press", "squat", "3 x 10-12", 30),
+        TEMPLATE_EXERCISE("Walking Lunge", "lunge", "3 x 10/leg", 25),
+        TEMPLATE_EXERCISE("Leg Extension", "isolation-lower", "3 x 12-15", 20),
+      ] },
+    ],
+  },
 ];
 
 function programFromTemplate(tpl) {
@@ -2369,7 +2423,10 @@ function ExerciseCard({ exercise, target, timer, coachNote, program, onChange, o
     onChange({ ...exercise, notes });
   }
 
-  const restPresets = [45, 60, 90, 120];
+  // 20 and 30 exist for the Express format, where the short rest IS the method — without them
+  // the only way to get a 20 s rest was to pick 45 and cut it short, which defeats the ring.
+  // The row is flex-wrap, so six presets reflow rather than overflow on a narrow phone.
+  const restPresets = [20, 30, 45, 60, 90, 120];
   const slotId = exercise.substituteFor || exercise.id;
   const slotMatch = exercise.substituteFor && program
     ? programSlots(program).find((s) => s.id === exercise.substituteFor)
@@ -3000,7 +3057,9 @@ function programFromGenerated(generated) {
         name: e.name,
         muscle: "",
         target: e.target || "",
-        rest: Math.min(300, Math.max(30, Number(e.rest) || DEFAULT_REST)),
+        // Floor is 15 s, not 30: someone asking the generator for a 20-minute circuit is
+        // asking for short rests, and clamping them back to 30 silently refused the request.
+        rest: Math.min(300, Math.max(15, Number(e.rest) || DEFAULT_REST)),
         link: "",
         pattern: e.pattern,
         meta: metaFromPattern(e.pattern),
@@ -3154,6 +3213,67 @@ function AiProgramPanel({ profile, lang, autoOpen, onAccept }) {
   );
 }
 
+/**
+ * The starting programs, reachable after onboarding.
+ *
+ * They used to exist only on the onboarding screen, so the only way an already-onboarded user
+ * could adopt one was to wipe their profile and start over. Same lesson as the AI panel (§6):
+ * a feature behind the one screen you see exactly once is a feature nobody has. Adding a
+ * template is now also a product decision that reaches existing users, not just new ones.
+ *
+ * Loads into the draft rather than saving, for the same reason generation does: a template
+ * replaces every day in your program, and that shouldn't happen on one tap with no way back.
+ * Nothing is written until Save.
+ */
+function TemplatePanel({ onPick }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className="w-full mb-4 flex items-center justify-center gap-2 rounded-xl border border-dashed border-gray-300 bg-gray-50 text-gray-600 text-sm font-semibold py-3"
+      >
+        <Dumbbell size={15} /> {t("tpl.open")}
+      </button>
+    );
+  }
+
+  return (
+    <div className="mb-4 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3.5">
+      <div className="flex items-center gap-1.5 mb-2">
+        <Dumbbell size={14} className="text-gray-500" />
+        <p className="text-sm font-semibold text-gray-700">{t("tpl.title")}</p>
+      </div>
+
+      <WithInfo text={t("tpl.explain")} className="mb-2.5">
+        <p className="text-xs text-gray-600">{t("tpl.explainTitle")}</p>
+      </WithInfo>
+
+      <div className="space-y-2 mb-2.5">
+        {PROGRAM_TEMPLATES.map((tpl) => (
+          <button
+            key={tpl.id}
+            onClick={() => { onPick(programFromTemplate(tpl)); setOpen(false); }}
+            className="w-full text-left rounded-lg bg-white border border-gray-200 px-3 py-2.5"
+          >
+            <p className="text-sm font-semibold">{t(`tpl.${tpl.id}`)}</p>
+            <p className="text-xs text-gray-500 mt-0.5 leading-snug">{t(`tpl.${tpl.id}.blurb`)}</p>
+          </button>
+        ))}
+      </div>
+
+      <button
+        onClick={() => setOpen(false)}
+        className="w-full bg-white border border-gray-200 text-gray-600 text-sm font-semibold rounded-md py-2"
+      >
+        {t("common.cancel")}
+      </button>
+    </div>
+  );
+}
+
 function ProgramEditor({ program, profile, autoOpenAi, onCommit, onReset, onBack }) {
   const t = useT();
   const lang = useLang();
@@ -3252,6 +3372,13 @@ function ProgramEditor({ program, profile, autoOpenAi, onCommit, onReset, onBack
         onAccept={(generated) => {
           setDraft(generated);
           setOpenDayId(generated.days[0] ? generated.days[0].id : null);
+        }}
+      />
+
+      <TemplatePanel
+        onPick={(next) => {
+          setDraft(next);
+          setOpenDayId(next.days[0] ? next.days[0].id : null);
         }}
       />
 

@@ -1,7 +1,7 @@
 # Chetamba — state of the project
 
 *A briefing document, written to be pasted into a fresh conversation. Assumes no prior
-context. Last updated 2026-08-19 09:23.*
+context. Last updated 2026-10-12 10:12.*
 
 There is a much longer engineering handover doc in the repo (`workout_tracker.md`, ~670
 lines). This one is the strategic summary: what exists, what it cost to learn, what's
@@ -64,7 +64,7 @@ Original constraints, still shaping the app:
 | Bot Worker deployed and answering | **Yes** — URL confirmed 2026-08-18 |
 | Cross-user scoring engine (`src/scoring.js`) | **Built and tested (52 checks)** |
 | English + Russian, app and bot (`src/i18n.js`) | **Built and tested** |
-| Onboarding, activities, program templates | **Done** |
+| Onboarding, activities, program templates | **Done** — 4 templates, pickable after onboarding too |
 | Bot: KV, `/score`, publish-on-finish, crons | **Written and tested** |
 | AI program generation (`bot/program-ai.js`) | **Built and tested — needs an API key (§8)** |
 | **Everything since the last deploy** | **NOT DEPLOYED — see §8** |
@@ -81,7 +81,9 @@ Original constraints, still shaping the app:
   languages.
 - **Rating + tiers**, with per-exercise progress charts.
 - **Export** — copy history as readable markdown or lossless JSON, in either language.
-- **Editable program + substitution.**
+- **Editable program + substitution**, and four starting templates — including **Express, 20
+  minutes** (six short days, three exercises, 20–30 s rest) for training most days rather than
+  twice a week. Templates are now reachable from the program editor, not only at onboarding.
 - **Language switch** — Profile tab and onboarding; the bot asks on first `/start`.
 - **AI program generation** — describe a program in plain text, review it, save it. Runs
   server-side on the Worker; nothing is saved without the user pressing Save.
@@ -215,6 +217,33 @@ per-activity `ceiling` stops "I logged a 14-hour hike" with no decline required.
   have trained can never drag you below average.
 - **No layoff penalty.** Time off is already visible on the weekly effort axis and in
   per-pattern decay; deducting a third time punished one absence three ways.
+
+### The effort curve has a shape, and programs have to be built for it
+
+Crediting *distinct patterns* per session means a true one-muscle-group day is worth very
+little, and the arithmetic is worse than it looks:
+
+| A week of | Effort | Effort points |
+|---|---|---|
+| 7 × single-pattern "chest day / back day" sessions | 3.0 | **75** |
+| 4 × upper/lower days (4–5 patterns each) | 4.6 → capped | **100** |
+
+**Training every day would have scored lower than training four times.** That's the opposite
+of what the effort axis exists to reward, and nothing about it is visible on screen — both
+weeks just show a number.
+
+The fix was to the *program*, not the curve: the Express template pairs three distinct
+patterns per day (~0.98 each), so six short days clear the week comfortably. Chosen over
+adding a days-trained bonus to the effort axis because it needs no change to the scoring
+model and is better training anyway — three hard sets on one pattern is where the returns
+stop, which is exactly what `SETS_FOR_FULL_PATTERN` already encodes. Express also covers all
+12 ranked slots weekly, so strength keeps moving; on a 21-day half-life a 6-day rotation is
+gentler than the 4-day split.
+
+**Generalise this when adding any template or tuning the generator:** a day is a bundle of
+patterns, and a day that repeats one pattern is mostly unscored. `tests/test-program.mjs`
+asserts the three-pattern rule on Express, because tidying it into muscle-group days would
+break the format silently.
 
 ### Consequence worth knowing
 
@@ -387,6 +416,9 @@ Two OpenAI-specific traps, both already handled and both easy to reintroduce:
 | **AI generation on the Worker, never the client** | The bundle is public (§5). This is also why the coach stays rule-based |
 | **The model's exclusions are checked server-side** | It will produce the exact lift someone said they can't do, and they usually said it because of an injury |
 | **Generation has two entry points, both in Profile** | It shipped only inside the program editor and the first person to look for it gave up. Discovery is a feature; `tests/test-program.mjs` now asserts it from a cold start |
+| **Template days are pattern pairings, never one muscle group** | The effort axis credits distinct patterns, so a "chest day" scores a third of what the session deserves. Fixing the template beat changing the curve (§4) |
+| **Templates are reachable from the program editor, not just onboarding** | They were behind the one screen you see exactly once, so an existing user had to wipe their profile to adopt one. Same discovery failure as the generator |
+| **A template loads into the draft and waits for Save** | It replaces every day you have. Same review-before-commit rule as AI generation |
 | **Explanatory copy sits behind a ⓘ toggle** | ~2,200 characters of it were open on every screen. Each paragraph was worth writing and none are worth reading twice — on the fifth visit they're noise between you and the thing you opened the app to do |
 | **The ⓘ wraps a heading, never floats alone** | An unlabelled ⓘ makes people tap it to find out what it is, which is the opposite of the point |
 
@@ -418,6 +450,15 @@ rush. **Still the priority.** Candidate answers, cheapest first:
 
 ### Product gaps
 
+- **A days-trained term on the effort axis — deliberately held, not rejected.** The Express
+  template works around the curve's shape (§4) rather than changing it. If after a month of
+  daily training the board still reads ~75 effort points, that's the evidence to add a
+  saturating bonus for distinct days trained in the week. It would be additive and never
+  declining, so it fits the §6 rules, and the existing 2-sessions-per-day cap stops it being
+  farmed. Don't add it speculatively; the pairing fix may be enough.
+- **No elapsed-session timer.** Express is named for 20 minutes but nothing tells you whether
+  you hit it. There is a `minutes` field on lifting sessions — it's stored and never scored,
+  so "20 min" is currently a label rather than a measurement.
 - No import/restore to match the export.
 - No way to edit or correct a past session.
 - Duration work is logged as **seconds typed into the reps field**. Needs a real input.
@@ -501,6 +542,10 @@ this document.**
 - **Read the Russian on a real phone**, and check the standings table alignment there.
   Automated tests prove the strings are present and within their character budgets; they
   cannot tell you a sentence reads like a translation.
+- **Check the 6-day Express grid on a real phone.** Above four days the day selector switches
+  to three columns (`app.jsx`), so Express renders seven buttons over three rows — and the
+  Russian day names ("Жимовой", "Тяговый", "Наклон") are the longest ones in it. jsdom runs no
+  CSS, so no test can see this.
 - **Try one real generation** and read what comes back before letting friends near it. The
   validation layer is tested against fabricated output, not against the model's.
 

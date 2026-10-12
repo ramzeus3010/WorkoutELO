@@ -338,4 +338,85 @@ console.log("\nfinding the program generator");
   check("and it offers a Generate action", !!buttonWithText(doc, "Generate"));
 }
 
+// ---------------------------------------------------------------- the Express template
+// Two separate things are pinned here.
+//
+// DISCOVERY: templates used to live only on the onboarding screen, so an existing user could
+// not adopt one without wiping their profile. Same failure as the generator above.
+//
+// SHAPE: every Express day must cover at least three DISTINCT ranked movement patterns, and
+// the six days together must cover all twelve. This is the entire reason the template is
+// built as pattern pairings rather than muscle-group days, and the failure is silent — a
+// "chest day" of three pressing variations logs perfectly and simply scores a third of what
+// the session deserves, because liftingEffort() credits distinct patterns, not exercises.
+// Someone tidying this template into one-muscle-per-day would break the format and nothing
+// would throw.
+console.log("\nthe Express template");
+{
+  const { w, doc, errs } = boot();
+  await sleep(700);
+
+  click(w, buttonWithText(doc, "Profile"));
+  await sleep(400);
+  click(w, buttonWithText(doc, "Edit program"));
+  await sleep(400);
+
+  const openTpl = buttonWithText(doc, "Start from a template");
+  check("the program editor offers the built-in templates", !!openTpl, rootText(w).slice(0, 400));
+
+  click(w, openTpl);
+  await sleep(300);
+  check("the Express program is on offer", rootText(w).includes("Express, 20 minutes"));
+  check("it says a template replaces your program", /Replace your program/i.test(rootText(w)));
+
+  click(w, buttonWithText(doc, "Express, 20 minutes"));
+  await sleep(400);
+
+  // Loaded into the draft, not saved — same review-before-commit rule the generator follows.
+  check("the days land in the editor", rootText(w).includes("Legs B"), rootText(w).slice(0, 500));
+  check("nothing is written before Save", w.localStorage.getItem("prog_d_legs-b") === null);
+
+  click(w, buttonWithText(doc, "Save program"));
+  await sleep(800);
+
+  const head = JSON.parse(w.localStorage.getItem("prog_v1") || "null");
+  check("the program saves", !!head && head.days.length === 6, JSON.stringify(head && head.days));
+
+  // Conditioning is excluded from RANKED_SLOTS, so it cannot fill one of these.
+  const RANKED = new Set([
+    "push-horizontal", "push-vertical", "pull-horizontal", "pull-vertical", "squat", "hinge",
+    "lunge", "isolation-upper", "isolation-lower", "calves", "bodyweight-reps", "core",
+  ]);
+
+  const thin = [];
+  const weekly = new Set();
+  (head ? head.days : []).forEach((d) => {
+    const list = JSON.parse(w.localStorage.getItem("prog_d_" + d.id) || "[]");
+    const patterns = new Set(list.map((e) => e.pattern).filter((p) => RANKED.has(p)));
+    patterns.forEach((p) => weekly.add(p));
+    if (patterns.size < 3) thin.push(`${d.id}: ${[...patterns].join(",") || "none"}`);
+  });
+
+  check(
+    "every Express day covers three distinct ranked patterns",
+    thin.length === 0,
+    thin.length ? `thin days: ${thin.join(" | ")}` : ""
+  );
+  check(
+    "the six days cover all twelve ranked slots in a week",
+    weekly.size === RANKED.size,
+    `${weekly.size} of ${RANKED.size}: missing ${[...RANKED].filter((p) => !weekly.has(p)).join(", ")}`
+  );
+
+  // The short rest IS the method, so it has to survive the round trip to storage.
+  const pushDay = JSON.parse(w.localStorage.getItem("prog_d_push") || "[]");
+  check(
+    "the short rests are preserved, not clamped back up",
+    pushDay.length > 0 && pushDay.every((e) => e.rest <= 30),
+    pushDay.map((e) => `${e.id}:${e.rest}`).join(" ")
+  );
+
+  check("no console errors adopting a template", errs.length === 0, errs.join("\n"));
+}
+
 finish("program");
